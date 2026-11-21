@@ -1,0 +1,136 @@
+# AegisTG Default Protection Policy
+# Strictly aligned with Telegram Terms of Service, Privacy Policy, and 2025-2026 Moderation Standards.
+
+thresholds:
+  warn: 35
+  delete_restrict: 55
+  delete_ban: 75
+  hard_block_fedban: 90
+  semantic_ai_min: 35
+  semantic_ai_max: 74
+
+raid:
+  join_window_seconds: 60
+  elevated_joins_threshold: 8
+  lockdown_joins_threshold: 20
+  violation_window_seconds: 30
+  elevated_violations_threshold: 3
+  lockdown_violations_threshold: 8
+  elevated_cooldown_seconds: 600
+  lockdown_cooldown_seconds: 300
+  sandbox_duration_seconds: 600
+  sandbox_clean_messages_required: 3
+  flood_window_seconds: 10
+  flood_max_messages: 6
+
+edit_bait:
+  delayed_edit_seconds: 60
+  url_injection_risk: 45
+  high_mutation_ratio: 0.65
+  high_mutation_risk: 30
+  snapshot_ttl_days: 7
+
+channel_guard:
+  strict_auto_quarantine: false  # Set true per-channel via /strict_channel on to auto-delete high-risk channel posts
+  auto_quarantine_min_score: 80
+  admin_burst_window_seconds: 60
+  admin_burst_max_posts: 10
+
+reputation:
+  cas_enabled: false             # Enable in production when outbound internet is available
+  cas_timeout_seconds: 1.5
+  cas_cache_ttl_seconds: 21600
+  initial_trust_score: 50
+  federation_sync_enabled: true
+
+media:
+  dhash_hamming_threshold: 8
+  viral_media_window_seconds: 300
+  viral_media_unique_users: 3
+  dangerous_extensions:
+    - ".apk"
+    - ".xapk"
+    - ".exe"
+    - ".msi"
+    - ".scr"
+    - ".bat"
+    - ".cmd"
+    - ".ps1"
+    - ".vbs"
+    - ".vbe"
+    - ".js"
+    - ".jse"
+    - ".hta"
+    - ".lnk"
+    - ".pif"
+    - ".com"
+    - ".jar"
+    - ".sh"
+    - ".dmg"
+    - ".pkg"
+    - ".iso"
+    - ".reg"
+
+urls:
+  allowlist_domains:
+    - "telegram.org"
+    - "core.telegram.org"
+    - "t.me"
+    - "github.com"
+    - "wikipedia.org"
+    - "youtube.com"
+    - "youtu.be"
+    - "google.com"
+    - "docs.google.com"
+    - "stackoverflow.com"
+  denylist_domains:
+    - "telegram-verify.com"
+    - "t-safeguard.com"
+    - "safeguard-verify.xyz"
+    - "telegram-antispam.org"
+    - "web-telegram-login.com"
+  shortener_domains:
+    - "bit.ly"
+    - "tinyurl.com"
+    - "t.co"
+    - "is.gd"
+    - "rb.gy"
+    - "cutt.ly"
+    - "shorturl.at"
+    - "rebrand.ly"
+    - "ow.ly"
+    - "clck.ru"
+    - "tiny.cc"
+  high_risk_tlds:
+    - ".xyz"
+    - ".top"
+    - ".click"
+    - ".tk"
+    - ".ml"
+    - ".ga"
+    - ".cf"
+    - ".gq"
+    - ".icu"
+    - ".buzz"
+    - ".vip"
+    - ".cfd"
+    - ".sbs"
+  protected_brands:
+    - "telegram"
+    - "botfather"
+    - "fragment"
+    - "safeguard"
+    - "tonkeeper"
+    - "binance"
+    - "coinbase"
+    - "metamask"
+    - "bkash"
+    - "nagad"
+  block_external_telegram_invites_for_non_admins: true
+
+rate_limits:
+  global_requests_per_second: 25.0
+  per_chat_messages_per_minute: 18
+  delete_batch_window_ms: 150
+  max_delete_batch_size: 100
+  max_retries: 3

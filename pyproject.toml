@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aegistg-protector"
+version = "1.0.0"
+description = "Intelligent 9-Layer Telegram Group & Channel Protection System"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "PyYAML>=6.0",
+    "Pillow>=10.0",
+]
+
+[project.scripts]
+aegistg = "protector.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["protector*"]
