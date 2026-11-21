@@ -1,4 +1,4 @@
-"""Secure Async Webhook Server validating X-Telegram-Bot-Api-Secret-Token."""
+"""Secure Async Webhook & Observability Server (Secret-Token Auth + /health + /metrics)."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ logger = logging.getLogger("aegistg.webhook")
 
 
 class WebhookServer:
-    """Lightweight asyncio HTTP webhook receiver for Telegram Bot API updates."""
+    """Lightweight asyncio HTTP webhook receiver with /health, /ready, and /metrics."""
 
     def __init__(self, bot: AegisTGBot, path: str = "/telegram/webhook") -> None:
         self.bot = bot
@@ -35,8 +35,11 @@ class WebhookServer:
             self._handle_connection, cfg.webhook_host, cfg.webhook_port
         )
         logger.info("Webhook HTTP server listening on %s:%s%s", cfg.webhook_host, cfg.webhook_port, self.path)
-        async with self._server:
-            await self._server.serve_forever()
+        try:
+            async with self._server:
+                await self._server.serve_forever()
+        finally:
+            await self.bot.shutdown()
 
     async def _handle_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -56,15 +59,28 @@ class WebhookServer:
                     k, v = line.split(":", 1)
                     headers[k.strip().lower()] = v.strip()
 
-            if method == "GET" and req_path == "/health":
-                await self._write_response(writer, 200, '{"status":"ok"}', "application/json")
+            if method == "GET" and req_path in {"/health", "/ready"}:
+                await self._write_response(
+                    writer,
+                    200,
+                    json.dumps({"status": "ok", "bot": self.bot.bot_username, "version": "2.0.0"}),
+                    "application/json",
+                )
+                return
+
+            if method == "GET" and req_path == "/metrics":
+                await self._write_response(
+                    writer,
+                    200,
+                    json.dumps(self.bot.metrics.snapshot(), indent=2),
+                    "application/json",
+                )
                 return
 
             if method != "POST" or req_path != self.path:
                 await self._write_response(writer, 404, "Not Found")
                 return
 
-            # Constant-time secret token verification (Mandatory Bot API Webhook Security!)
             expected_secret = self.bot.config.webhook_secret_token
             if expected_secret:
                 provided = headers.get("x-telegram-bot-api-secret-token", "")
@@ -81,7 +97,6 @@ class WebhookServer:
             body = await asyncio.wait_for(reader.readexactly(content_length), timeout=10.0)
             update = json.loads(body.decode("utf-8"))
 
-            # Return 200 OK immediately so Telegram never times out or retries duplicates
             await self._write_response(writer, 200, '{"ok":true}', "application/json")
             asyncio.create_task(self.bot.handle_update(update))
         except Exception as exc:

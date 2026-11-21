@@ -1,11 +1,13 @@
-"""Behavioral Defense Layer: Raid State Machine, Edit-Bait Forensics, Sender-Chat Spoof & Admin Anomaly Guard."""
+"""Behavioral Defense Layer: Memory-Bounded Raid State Machine, Edit-Bait Forensics & Admin Guard."""
 
 from __future__ import annotations
 
 import hashlib
 import re
-from collections import defaultdict, deque
+from collections import OrderedDict, deque
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TypeVar
 
 from protector.config import ChannelGuardConfig, EditBaitConfig, RaidConfig
 from protector.models import (
@@ -23,6 +25,32 @@ from protector.normalizer import NormalizedText
 from protector.storage import Storage
 
 _RE_TOKENS = re.compile(r"[a-z0-9\u0980-\u09FF]{2,}", re.UNICODE)
+
+# Hard memory bounds so 24/7 operation stays RAM-flat even under massive botnet DDoS
+MAX_TRACKED_CHATS = 5_000
+MAX_TRACKED_USERS = 20_000
+MAX_TRACKED_ADMINS = 5_000
+
+_K = TypeVar("_K")
+_V = TypeVar("_V")
+
+
+class _BoundedLRUDict(OrderedDict[_K, _V]):
+    """OrderedDict with automatic oldest-entry eviction when maxsize is exceeded."""
+
+    def __init__(self, maxsize: int) -> None:
+        super().__init__()
+        self._maxsize = maxsize
+
+    def get_or_create(self, key: _K, factory: Callable[[], _V]) -> _V:
+        if key in self:
+            self.move_to_end(key)
+            return self[key]
+        if len(self) >= self._maxsize:
+            self.popitem(last=False)
+        val = factory()
+        self[key] = val
+        return val
 
 
 def _extract_token_set(text: str) -> set[str]:
@@ -47,7 +75,7 @@ class _ChatRuntimeState:
 
 
 class BehavioralAnalyzer:
-    """Stateful sliding-window behavioral, raid, edit-bait, and admin-compromise analyzer."""
+    """Stateful, memory-bounded sliding-window behavioral, raid, edit-bait & admin analyzer."""
 
     def __init__(
         self,
@@ -61,11 +89,15 @@ class BehavioralAnalyzer:
         self.channel_cfg = channel_cfg
         self.storage = storage
 
-        self._chat_states: dict[int, _ChatRuntimeState] = {}
-        self._join_windows: dict[int, deque[float]] = defaultdict(deque)
-        self._violation_windows: dict[int, deque[float]] = defaultdict(deque)
-        self._user_msg_windows: dict[tuple[int, int], deque[tuple[float, str]]] = defaultdict(deque)
-        self._admin_post_windows: dict[tuple[int, int], deque[float]] = defaultdict(deque)
+        self._chat_states: _BoundedLRUDict[int, _ChatRuntimeState] = _BoundedLRUDict(MAX_TRACKED_CHATS)
+        self._join_windows: _BoundedLRUDict[int, deque[float]] = _BoundedLRUDict(MAX_TRACKED_CHATS)
+        self._violation_windows: _BoundedLRUDict[int, deque[float]] = _BoundedLRUDict(MAX_TRACKED_CHATS)
+        self._user_msg_windows: _BoundedLRUDict[tuple[int, int], deque[tuple[float, str]]] = (
+            _BoundedLRUDict(MAX_TRACKED_USERS)
+        )
+        self._admin_post_windows: _BoundedLRUDict[tuple[int, int], deque[float]] = (
+            _BoundedLRUDict(MAX_TRACKED_ADMINS)
+        )
 
     # ------------------------------------------------------------------
     # Raid State Machine
@@ -79,8 +111,10 @@ class BehavioralAnalyzer:
             except ValueError:
                 initial = RaidState.NORMAL
             st = _ChatRuntimeState(raid_state=initial, state_changed_at=now, last_threat_at=now)
-            self._chat_states[chat_id] = st
+            self._chat_states.get_or_create(chat_id, lambda: st)
             return st.raid_state
+
+        self._chat_states.move_to_end(chat_id)
 
         # Automatic cooldown transitions when chat is quiet
         quiet_for = now - st.last_threat_at
@@ -94,7 +128,7 @@ class BehavioralAnalyzer:
         return st.raid_state
 
     def set_raid_state(self, chat_id: int, state: RaidState, now: float) -> None:
-        st = self._chat_states.setdefault(chat_id, _ChatRuntimeState())
+        st = self._chat_states.get_or_create(chat_id, _ChatRuntimeState)
         st.raid_state = state
         st.state_changed_at = now
         st.last_threat_at = now
@@ -105,7 +139,7 @@ class BehavioralAnalyzer:
     def record_join(self, chat_id: int, now: float) -> tuple[RaidState, bool]:
         """Record a member join and return (new_raid_state, triggered_new_lockdown)."""
         prev_state = self.get_raid_state(chat_id, now)
-        dq = self._join_windows[chat_id]
+        dq = self._join_windows.get_or_create(chat_id, deque)
         dq.append(now)
         while dq and now - dq[0] > self.raid_cfg.join_window_seconds:
             dq.popleft()
@@ -128,7 +162,7 @@ class BehavioralAnalyzer:
     def record_high_risk_violation(self, chat_id: int, now: float) -> tuple[RaidState, bool]:
         """Escalate Raid State if multiple high-risk violations erupt rapidly."""
         prev_state = self.get_raid_state(chat_id, now)
-        dq = self._violation_windows[chat_id]
+        dq = self._violation_windows.get_or_create(chat_id, deque)
         dq.append(now)
         while dq and now - dq[0] > self.raid_cfg.violation_window_seconds:
             dq.popleft()
@@ -200,7 +234,7 @@ class BehavioralAnalyzer:
         # 3. Admin Burst / Possible Hijack Anomaly Guard
         if event.is_admin or event.chat_type == ChatType.CHANNEL:
             actor_key = (event.chat_id, event.user_id or event.sender_chat_id or 0)
-            dq = self._admin_post_windows[actor_key]
+            dq = self._admin_post_windows.get_or_create(actor_key, deque)
             dq.append(event.timestamp)
             while dq and event.timestamp - dq[0] > self.channel_cfg.admin_burst_window_seconds:
                 dq.popleft()
@@ -223,7 +257,7 @@ class BehavioralAnalyzer:
         if event.user_id is not None and event.chat_type in {ChatType.GROUP, ChatType.SUPERGROUP}:
             content_hash = hashlib.sha256(norm.folded_ascii.encode("utf-8")).hexdigest()[:16]
             key = (event.chat_id, event.user_id)
-            dq = self._user_msg_windows[key]
+            dq = self._user_msg_windows.get_or_create(key, deque)
             dq.append((event.timestamp, content_hash))
             while dq and event.timestamp - dq[0][0] > self.raid_cfg.flood_window_seconds:
                 dq.popleft()
@@ -262,7 +296,6 @@ class BehavioralAnalyzer:
                     and user_rep.clean_messages < self.raid_cfg.sandbox_clean_messages_required
                 )
                 if is_sandboxed:
-                    # First-second bot spammer posting untrusted link or forward immediately after joining!
                     if membership_age <= 15.0 and (
                         untrusted_url_count > 0 or event.is_forwarded or event.via_bot_id
                     ):
@@ -319,7 +352,6 @@ class BehavioralAnalyzer:
         delay_sec = max(0.0, edit_ts - snap.created_at)
         is_delayed = delay_sec >= self.edit_cfg.delayed_edit_seconds
 
-        # 1. URL Injection in Edited Message (original had 0 URLs -> edit introduces URL!)
         if snap.url_count == 0 and new_url_count > 0:
             score = self.edit_cfg.url_injection_risk if is_delayed else 25
             signals.append(
@@ -335,7 +367,6 @@ class BehavioralAnalyzer:
                 )
             )
 
-        # 2. High-Mutation Delayed Rewrite (completely replacing an old benign message)
         old_tokens = set(snap.token_fingerprint.split()) if snap.token_fingerprint else set()
         new_tokens = _extract_token_set(norm.folded_ascii)
         mutation = _jaccard_mutation(old_tokens, new_tokens)

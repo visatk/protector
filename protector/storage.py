@@ -1,13 +1,13 @@
-"""SQLite WAL persistence layer for AegisTG Protector.
+"""Production-hardened SQLite WAL persistence layer for AegisTG Protector v2.0.
 
-Stores minimal privacy-compliant security state:
-- Chat protection configs & pre-lockdown permission snapshots
-- Behavioral user trust ledger & strikes
-- Local Federation ban table (users & spoofed sender_chats)
-- Short-lived message structural snapshots (Edit-Bait detection, TTL-pruned)
-- Banned media perceptual hashes (64-bit dHash integers)
-- CAS threat-intel cache
-- Privacy-redacted incident audit log (for owner alerts & abuse@telegram.org appeal packs)
+Key reliability & concurrency upgrades:
+- Explicit `BEGIN IMMEDIATE` write transactions (`isolation_level=None`) eliminating
+  SQLITE_BUSY_SNAPSHOT read-to-write upgrade deadlocks under asyncio load.
+- Production PRAGMAs: WAL mode, busy_timeout=5000ms, synchronous=NORMAL,
+  temp_store=MEMORY, 16MB cache_size, 64MB mmap_size, foreign_keys=ON.
+- `PRAGMA user_version` schema migrations (v1 -> v2) with zero data loss.
+- False-Positive Self-Healing Feedback & Precision Ledger + Per-Chat Muted Rules.
+- Periodic passive WAL checkpointing and automated TTL retention pruning.
 """
 
 from __future__ import annotations
@@ -16,8 +16,9 @@ import json
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from protector.models import (
     ChatConfig,
@@ -26,27 +27,64 @@ from protector.models import (
     UserReputation,
 )
 
+SCHEMA_VERSION = 2
+
 
 class Storage:
-    """Thread-safe SQLite WAL repository."""
+    """Thread-safe, deadlock-free SQLite WAL repository."""
 
     def __init__(self, db_path: str | Path = "data/aegistg.db") -> None:
         self.db_path = str(db_path)
         if self.db_path != ":memory:":
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        # isolation_level=None enables explicit BEGIN IMMEDIATE transactions
+        self._conn = sqlite3.connect(
+            self.db_path, timeout=5.0, isolation_level=None, check_same_thread=False
+        )
         self._conn.row_factory = sqlite3.Row
-        self._init_schema()
+        self._configure_pragmas()
+        self._migrate_schema()
 
-    def _init_schema(self) -> None:
+    def _configure_pragmas(self) -> None:
+        with self._lock:
+            self._conn.execute("PRAGMA journal_mode=WAL;")
+            self._conn.execute("PRAGMA busy_timeout=5000;")
+            self._conn.execute("PRAGMA synchronous=NORMAL;")
+            self._conn.execute("PRAGMA foreign_keys=ON;")
+            self._conn.execute("PRAGMA temp_store=MEMORY;")
+            self._conn.execute("PRAGMA cache_size=-16000;")  # 16 MB page cache
+            if self.db_path != ":memory:":
+                self._conn.execute("PRAGMA mmap_size=67108864;")  # 64 MB memory-mapped reads
+
+    @contextmanager
+    def _write_tx(self) -> Iterator[sqlite3.Cursor]:
+        """Acquire write lock immediately to prevent SQLITE_BUSY_SNAPSHOT upgrade deadlocks."""
         with self._lock:
             cur = self._conn.cursor()
-            cur.execute("PRAGMA journal_mode=WAL;")
-            cur.execute("PRAGMA synchronous=NORMAL;")
-            cur.execute("PRAGMA foreign_keys=ON;")
+            cur.execute("BEGIN IMMEDIATE;")
+            try:
+                yield cur
+                cur.execute("COMMIT;")
+            except Exception:
+                try:
+                    cur.execute("ROLLBACK;")
+                except sqlite3.Error:
+                    pass
+                raise
 
-            cur.executescript(
+    def _migrate_schema(self) -> None:
+        with self._lock:
+            ver = int(self._conn.execute("PRAGMA user_version;").fetchone()[0])
+            if ver < 1:
+                self._apply_v1()
+            if ver < 2:
+                self._apply_v2()
+            self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION};")
+
+    def _apply_v1(self) -> None:
+        with self._write_tx() as cur:
+            cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS chat_configs (
                     chat_id INTEGER PRIMARY KEY,
@@ -63,7 +101,10 @@ class Storage:
                     federation_id TEXT NOT NULL DEFAULT 'default',
                     updated_at REAL NOT NULL DEFAULT 0
                 );
-
+                """
+            )
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS user_reputation (
                     chat_id INTEGER NOT NULL,
                     user_id INTEGER NOT NULL,
@@ -74,7 +115,10 @@ class Storage:
                     last_violation_at REAL,
                     PRIMARY KEY (chat_id, user_id)
                 );
-
+                """
+            )
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS federation_bans (
                     federation_id TEXT NOT NULL,
                     entity_id INTEGER NOT NULL,
@@ -85,7 +129,10 @@ class Storage:
                     created_at REAL NOT NULL,
                     PRIMARY KEY (federation_id, entity_id)
                 );
-
+                """
+            )
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS message_snapshots (
                     chat_id INTEGER NOT NULL,
                     message_id INTEGER NOT NULL,
@@ -98,8 +145,13 @@ class Storage:
                     created_at REAL NOT NULL,
                     PRIMARY KEY (chat_id, message_id)
                 );
-                CREATE INDEX IF NOT EXISTS idx_snapshots_created ON message_snapshots(created_at);
-
+                """
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_snapshots_created ON message_snapshots(created_at);"
+            )
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS banned_media_hashes (
                     dhash_hex TEXT PRIMARY KEY,
                     dhash_int INTEGER NOT NULL,
@@ -107,14 +159,20 @@ class Storage:
                     reason TEXT NOT NULL,
                     added_at REAL NOT NULL
                 );
-
+                """
+            )
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS cas_cache (
                     user_id INTEGER PRIMARY KEY,
                     is_banned INTEGER NOT NULL,
                     offenses INTEGER NOT NULL DEFAULT 0,
                     checked_at REAL NOT NULL
                 );
-
+                """
+            )
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS incidents (
                     incident_id TEXT PRIMARY KEY,
                     timestamp REAL NOT NULL,
@@ -131,13 +189,57 @@ class Storage:
                     latency_ms REAL NOT NULL,
                     redacted_preview TEXT NOT NULL DEFAULT ''
                 );
-                CREATE INDEX IF NOT EXISTS idx_incidents_chat_ts ON incidents(chat_id, timestamp DESC);
                 """
             )
-            self._conn.commit()
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_incidents_chat_ts ON incidents(chat_id, timestamp DESC);"
+            )
+
+    def _apply_v2(self) -> None:
+        """v2 migration: Self-healing False-Positive Feedback Loop & Per-Chat Rule Exceptions."""
+        with self._write_tx() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS incident_feedback (
+                    incident_id TEXT PRIMARY KEY,
+                    chat_id INTEGER NOT NULL,
+                    verdict TEXT NOT NULL,  -- 'CONFIRMED' | 'FALSE_POSITIVE'
+                    reviewer_id INTEGER NOT NULL,
+                    notes TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL
+                );
+                """
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_feedback_chat ON incident_feedback(chat_id, verdict);"
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_rule_exceptions (
+                    chat_id INTEGER NOT NULL,
+                    rule_id TEXT NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY (chat_id, rule_id)
+                );
+                """
+            )
+
+    def checkpoint_wal(self) -> tuple[int, int, int]:
+        """Run non-blocking PASSIVE WAL checkpoint to prevent unbounded .db-wal growth."""
+        if self.db_path == ":memory:":
+            return (0, 0, 0)
+        with self._lock:
+            row = self._conn.execute("PRAGMA wal_checkpoint(PASSIVE);").fetchone()
+            return (int(row[0]), int(row[1]), int(row[2]))
 
     def close(self) -> None:
         with self._lock:
+            try:
+                if self.db_path != ":memory:":
+                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            except sqlite3.Error:
+                pass
             self._conn.close()
 
     # ------------------------------------------------------------------
@@ -150,24 +252,34 @@ class Storage:
             ).fetchone()
             if not row:
                 return ChatConfig(chat_id=chat_id)
-            return ChatConfig(
-                chat_id=row["chat_id"],
-                chat_type=row["chat_type"],
-                title=row["title"],
-                enabled=bool(row["enabled"]),
-                alert_chat_id=row["alert_chat_id"],
-                linked_parent_channel_id=row["linked_parent_channel_id"],
-                strict_channel_guard=bool(row["strict_channel_guard"]),
-                require_join_verification=bool(row["require_join_verification"]),
-                allowlist_domains=json.loads(row["allowlist_domains_json"] or "[]"),
-                raid_state=row["raid_state"],
-                saved_permissions_json=row["saved_permissions_json"],
-                federation_id=row["federation_id"],
-            )
+            return self._row_to_chat_config(row)
+
+    def list_chat_configs(self, enabled_only: bool = True) -> list[ChatConfig]:
+        with self._lock:
+            q = "SELECT * FROM chat_configs WHERE enabled = 1 ORDER BY updated_at DESC" if enabled_only else "SELECT * FROM chat_configs ORDER BY updated_at DESC"
+            rows = self._conn.execute(q).fetchall()
+            return [self._row_to_chat_config(r) for r in rows]
+
+    @staticmethod
+    def _row_to_chat_config(row: sqlite3.Row) -> ChatConfig:
+        return ChatConfig(
+            chat_id=row["chat_id"],
+            chat_type=row["chat_type"],
+            title=row["title"],
+            enabled=bool(row["enabled"]),
+            alert_chat_id=row["alert_chat_id"],
+            linked_parent_channel_id=row["linked_parent_channel_id"],
+            strict_channel_guard=bool(row["strict_channel_guard"]),
+            require_join_verification=bool(row["require_join_verification"]),
+            allowlist_domains=json.loads(row["allowlist_domains_json"] or "[]"),
+            raid_state=row["raid_state"],
+            saved_permissions_json=row["saved_permissions_json"],
+            federation_id=row["federation_id"],
+        )
 
     def upsert_chat_config(self, cfg: ChatConfig) -> None:
-        with self._lock:
-            self._conn.execute(
+        with self._write_tx() as cur:
+            cur.execute(
                 """
                 INSERT INTO chat_configs (
                     chat_id, chat_type, title, enabled, alert_chat_id,
@@ -205,7 +317,6 @@ class Storage:
                     time.time(),
                 ),
             )
-            self._conn.commit()
 
     def is_chat_registered(self, chat_id: int) -> bool:
         with self._lock:
@@ -241,8 +352,8 @@ class Storage:
             return rep
 
     def save_user_reputation(self, rep: UserReputation) -> None:
-        with self._lock:
-            self._conn.execute(
+        with self._write_tx() as cur:
+            cur.execute(
                 """
                 INSERT INTO user_reputation (
                     chat_id, user_id, trust_score, joined_at, clean_messages, strikes, last_violation_at
@@ -264,7 +375,15 @@ class Storage:
                     rep.last_violation_at,
                 ),
             )
-            self._conn.commit()
+
+    def heal_user_after_false_positive(self, chat_id: int, user_id: int) -> UserReputation:
+        """Restore user trust & decrement strikes after an admin marks an incident False Positive."""
+        rep = self.get_user_reputation(chat_id, user_id)
+        rep.strikes = max(0, rep.strikes - 1)
+        rep.trust_score = min(100, max(65, rep.trust_score + 25))
+        rep.clean_messages = max(rep.clean_messages, 3)
+        self.save_user_reputation(rep)
+        return rep
 
     # ------------------------------------------------------------------
     # Federation Bans
@@ -278,8 +397,8 @@ class Storage:
         federation_id: str = "default",
         entity_type: str = "user",
     ) -> None:
-        with self._lock:
-            self._conn.execute(
+        with self._write_tx() as cur:
+            cur.execute(
                 """
                 INSERT INTO federation_bans (
                     federation_id, entity_id, entity_type, reason, category, source_chat_id, created_at
@@ -292,7 +411,6 @@ class Storage:
                 """,
                 (federation_id, entity_id, entity_type, reason, category, source_chat_id, time.time()),
             )
-            self._conn.commit()
 
     def get_federation_ban(
         self, entity_id: int, federation_id: str = "default"
@@ -305,20 +423,19 @@ class Storage:
             return dict(row) if row else None
 
     def remove_federation_ban(self, entity_id: int, federation_id: str = "default") -> bool:
-        with self._lock:
-            cur = self._conn.execute(
+        with self._write_tx() as cur:
+            cur.execute(
                 "DELETE FROM federation_bans WHERE federation_id = ? AND entity_id = ?",
                 (federation_id, entity_id),
             )
-            self._conn.commit()
             return cur.rowcount > 0
 
     # ------------------------------------------------------------------
     # Message Snapshots (Edit-Bait Detection)
     # ------------------------------------------------------------------
     def save_message_snapshot(self, snap: MessageSnapshot) -> None:
-        with self._lock:
-            self._conn.execute(
+        with self._write_tx() as cur:
+            cur.execute(
                 """
                 INSERT OR REPLACE INTO message_snapshots (
                     chat_id, message_id, user_id, content_sha256, token_fingerprint,
@@ -337,7 +454,6 @@ class Storage:
                     snap.created_at,
                 ),
             )
-            self._conn.commit()
 
     def get_message_snapshot(self, chat_id: int, message_id: int) -> MessageSnapshot | None:
         with self._lock:
@@ -359,24 +475,29 @@ class Storage:
                 created_at=row["created_at"],
             )
 
+    def prune_expired_data(self, snapshot_ttl_days: int = 7, incident_ttl_days: int = 90) -> dict[str, int]:
+        now = time.time()
+        snap_cutoff = now - snapshot_ttl_days * 86400
+        inc_cutoff = now - incident_ttl_days * 86400
+        with self._write_tx() as cur:
+            cur.execute("DELETE FROM message_snapshots WHERE created_at < ?", (snap_cutoff,))
+            snaps = cur.rowcount
+            cur.execute("DELETE FROM incidents WHERE timestamp < ?", (inc_cutoff,))
+            incs = cur.rowcount
+        self.checkpoint_wal()
+        return {"snapshots_pruned": snaps, "incidents_pruned": incs}
+
     def prune_expired_snapshots(self, ttl_days: int = 7) -> int:
-        cutoff = time.time() - ttl_days * 86400
-        with self._lock:
-            cur = self._conn.execute(
-                "DELETE FROM message_snapshots WHERE created_at < ?", (cutoff,)
-            )
-            self._conn.commit()
-            return cur.rowcount
+        return self.prune_expired_data(snapshot_ttl_days=ttl_days)["snapshots_pruned"]
 
     # ------------------------------------------------------------------
     # Perceptual Media Hashes (64-bit dHash)
     # ------------------------------------------------------------------
     def add_banned_media_hash(self, dhash_int: int, category: str, reason: str) -> None:
         dhash_hex = f"{dhash_int:016x}"
-        # Store signed 64-bit compatible or TEXT hex (SQLite INTEGER max is 2^63-1, so use hex as authoritative)
         signed_int = dhash_int - (1 << 64) if dhash_int >= (1 << 63) else dhash_int
-        with self._lock:
-            self._conn.execute(
+        with self._write_tx() as cur:
+            cur.execute(
                 """
                 INSERT OR REPLACE INTO banned_media_hashes (
                     dhash_hex, dhash_int, category, reason, added_at
@@ -384,7 +505,6 @@ class Storage:
                 """,
                 (dhash_hex, signed_int, category, reason, time.time()),
             )
-            self._conn.commit()
 
     def list_banned_media_hashes(self) -> list[tuple[int, str, str]]:
         with self._lock:
@@ -407,22 +527,21 @@ class Storage:
             return None
 
     def set_cas_cache(self, user_id: int, is_banned: bool, offenses: int = 0) -> None:
-        with self._lock:
-            self._conn.execute(
+        with self._write_tx() as cur:
+            cur.execute(
                 """
                 INSERT OR REPLACE INTO cas_cache (user_id, is_banned, offenses, checked_at)
                 VALUES (?, ?, ?, ?)
                 """,
                 (user_id, int(is_banned), offenses, time.time()),
             )
-            self._conn.commit()
 
     # ------------------------------------------------------------------
-    # Redacted Incident Forensics Log
+    # Redacted Incident Forensics Log & Self-Healing Precision Feedback
     # ------------------------------------------------------------------
     def record_incident(self, inc: IncidentRecord) -> None:
-        with self._lock:
-            self._conn.execute(
+        with self._write_tx() as cur:
+            cur.execute(
                 """
                 INSERT OR REPLACE INTO incidents (
                     incident_id, timestamp, chat_id, chat_type, event_type,
@@ -447,7 +566,15 @@ class Storage:
                     inc.redacted_preview,
                 ),
             )
-            self._conn.commit()
+
+    def get_incident(self, incident_id: str) -> IncidentRecord | None:
+        with self._lock:
+            r = self._conn.execute(
+                "SELECT * FROM incidents WHERE incident_id = ?", (incident_id,)
+            ).fetchone()
+            if not r:
+                return None
+            return self._row_to_incident(r)
 
     def get_incidents(
         self, chat_id: int, limit: int = 100, since_ts: float | None = None
@@ -471,25 +598,86 @@ class Storage:
                     """,
                     (chat_id, limit),
                 ).fetchall()
-            return [
-                IncidentRecord(
-                    incident_id=r["incident_id"],
-                    timestamp=r["timestamp"],
-                    chat_id=r["chat_id"],
-                    chat_type=r["chat_type"],
-                    event_type=r["event_type"],
-                    actor_id=r["actor_id"],
-                    sender_chat_id=r["sender_chat_id"],
-                    message_id=r["message_id"],
-                    primary_category=r["primary_category"],
-                    risk_score=r["risk_score"],
-                    action_taken=r["action_taken"],
-                    signals_summary=json.loads(r["signals_json"] or "[]"),
-                    latency_ms=r["latency_ms"],
-                    redacted_preview=r["redacted_preview"],
-                )
-                for r in rows
-            ]
+            return [self._row_to_incident(r) for r in rows]
+
+    @staticmethod
+    def _row_to_incident(r: sqlite3.Row) -> IncidentRecord:
+        return IncidentRecord(
+            incident_id=r["incident_id"],
+            timestamp=r["timestamp"],
+            chat_id=r["chat_id"],
+            chat_type=r["chat_type"],
+            event_type=r["event_type"],
+            actor_id=r["actor_id"],
+            sender_chat_id=r["sender_chat_id"],
+            message_id=r["message_id"],
+            primary_category=r["primary_category"],
+            risk_score=r["risk_score"],
+            action_taken=r["action_taken"],
+            signals_summary=json.loads(r["signals_json"] or "[]"),
+            latency_ms=r["latency_ms"],
+            redacted_preview=r["redacted_preview"],
+        )
+
+    def record_incident_feedback(
+        self, incident_id: str, chat_id: int, verdict: str, reviewer_id: int, notes: str = ""
+    ) -> None:
+        with self._write_tx() as cur:
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO incident_feedback (
+                    incident_id, chat_id, verdict, reviewer_id, notes, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (incident_id, chat_id, verdict, reviewer_id, notes, time.time()),
+            )
+
+    def get_precision_metrics(self, chat_id: int) -> dict[str, Any]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT verdict, COUNT(*) as cnt
+                FROM incident_feedback WHERE chat_id = ?
+                GROUP BY verdict
+                """,
+                (chat_id,),
+            ).fetchall()
+            counts = {r["verdict"]: int(r["cnt"]) for r in rows}
+            confirmed = counts.get("CONFIRMED", 0)
+            fp = counts.get("FALSE_POSITIVE", 0)
+            reviewed = confirmed + fp
+            # If no explicit feedback yet, assume 100% until an FP is marked
+            total_incidents = int(
+                self._conn.execute(
+                    "SELECT COUNT(*) FROM incidents WHERE chat_id = ?", (chat_id,)
+                ).fetchone()[0]
+            )
+            denom = max(reviewed, total_incidents)
+            precision_pct = 100.0 if denom == 0 else round(((denom - fp) / denom) * 100.0, 1)
+            muted = self.get_muted_rules(chat_id)
+            return {
+                "confirmed": confirmed,
+                "false_positives": fp,
+                "precision_pct": precision_pct,
+                "muted_rules": sorted(muted),
+            }
+
+    def add_muted_rule(self, chat_id: int, rule_id: str, reason: str = "") -> None:
+        with self._write_tx() as cur:
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO chat_rule_exceptions (chat_id, rule_id, reason, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (chat_id, rule_id, reason, time.time()),
+            )
+
+    def get_muted_rules(self, chat_id: int) -> set[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT rule_id FROM chat_rule_exceptions WHERE chat_id = ?", (chat_id,)
+            ).fetchall()
+            return {str(r["rule_id"]) for r in rows}
 
     def get_chat_stats(self, chat_id: int, window_seconds: int = 86400) -> dict[str, Any]:
         since = time.time() - window_seconds
@@ -523,9 +711,10 @@ class Storage:
 
     def purge_chat_data(self, chat_id: int) -> None:
         """Compliance right-to-erasure for a chat owner."""
-        with self._lock:
-            self._conn.execute("DELETE FROM chat_configs WHERE chat_id = ?", (chat_id,))
-            self._conn.execute("DELETE FROM user_reputation WHERE chat_id = ?", (chat_id,))
-            self._conn.execute("DELETE FROM message_snapshots WHERE chat_id = ?", (chat_id,))
-            self._conn.execute("DELETE FROM incidents WHERE chat_id = ?", (chat_id,))
-            self._conn.commit()
+        with self._write_tx() as cur:
+            cur.execute("DELETE FROM chat_configs WHERE chat_id = ?", (chat_id,))
+            cur.execute("DELETE FROM user_reputation WHERE chat_id = ?", (chat_id,))
+            cur.execute("DELETE FROM message_snapshots WHERE chat_id = ?", (chat_id,))
+            cur.execute("DELETE FROM incidents WHERE chat_id = ?", (chat_id,))
+            cur.execute("DELETE FROM incident_feedback WHERE chat_id = ?", (chat_id,))
+            cur.execute("DELETE FROM chat_rule_exceptions WHERE chat_id = ?", (chat_id,))

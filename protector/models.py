@@ -142,6 +142,7 @@ class EvaluationResult:
     used_semantic_ai: bool = False
     latency_ms: float = 0.0
     summary: str = ""
+    incident_id: str | None = None
 
     @property
     def primary_category(self) -> ThreatCategory | None:

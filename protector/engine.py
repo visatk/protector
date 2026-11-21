@@ -1,4 +1,4 @@
-"""Core 9-Layer Risk Aggregation & Decision Orchestrator for AegisTG Protector."""
+"""Core 9-Layer Risk Aggregation & Decision Orchestrator for AegisTG Protector v2.0."""
 
 from __future__ import annotations
 
@@ -21,18 +21,35 @@ from protector.models import (
     RaidState,
     RiskSignal,
     TelegramEvent,
+    ThreatCategory,
     VerdictAction,
 )
 from protector.normalizer import normalize_text, redact_pii
+from protector.security import RuntimeMetrics, clamp_text_for_inspection
 from protector.storage import Storage
+
+# Zero-tolerance categories can NEVER be muted by per-chat soft exceptions
+NON_MUTABLE_CATEGORIES = frozenset(
+    {
+        ThreatCategory.CSAM_EXPLOITATION,
+        ThreatCategory.VIOLENCE_TERRORISM,
+        ThreatCategory.MALWARE_EXPLOIT,
+    }
+)
 
 
 class ProtectionEngine:
     """Orchestrates all 9 defense layers into a deterministic, auditable Verdict."""
 
-    def __init__(self, config: BotConfig, storage: Storage) -> None:
+    def __init__(
+        self,
+        config: BotConfig,
+        storage: Storage,
+        metrics: RuntimeMetrics | None = None,
+    ) -> None:
         self.config = config
         self.storage = storage
+        self.metrics = metrics or RuntimeMetrics()
 
         self.text_analyzer = TextPolicyAnalyzer()
         self.url_analyzer = UrlIntelAnalyzer(config.urls)
@@ -59,8 +76,9 @@ class ProtectionEngine:
         raid_state = self.behavioral.get_raid_state(event.chat_id, event.timestamp)
         all_signals: list[RiskSignal] = []
 
-        # Layer 1 & 2: Normalize text once for all downstream text/URL/edit layers
-        norm = normalize_text(event.text)
+        # Layer 1 & 2: ReDoS-safe clamp & deep Unicode normalization
+        clamped_text = clamp_text_for_inspection(event.text)
+        norm = normalize_text(clamped_text)
 
         # Layer 3: Reputation, Local Federation Bans & CAS
         user_rep = None
@@ -71,11 +89,11 @@ class ProtectionEngine:
         # Layer 4: 8-Category Multilingual Text Policy + Obfuscation Evasion
         all_signals.extend(self.text_analyzer.analyze(event, norm))
 
-        # Layer 5: URL, Entity & Phishing Intelligence
+        # Layer 5: PSL + IDNA URL & Entity Intelligence
         url_signals, url_count, untrusted_url_count = self.url_analyzer.analyze(event, norm, chat_cfg)
         all_signals.extend(url_signals)
 
-        # Layer 6: Media, Malware Extension, Magic-Byte & 64-bit Perceptual dHash Guard
+        # Layer 6: Media, Malware Extension, Decompression Bomb & BK-Tree dHash Guard
         all_signals.extend(self.media_analyzer.analyze(event))
 
         # Layer 7: Behavioral, Sender-Chat Spoofing, Edit-Bait & Admin Anomaly Guard
@@ -87,7 +105,18 @@ class ProtectionEngine:
             )
             all_signals.extend(beh_signals)
 
-        # Aggregate deterministic risk score before deciding on gray-zone AI escalation
+        # Filter per-chat soft-exception muted rules (never muting zero-tolerance categories!)
+        if not is_dry_run and all_signals:
+            muted_rules = self.storage.get_muted_rules(event.chat_id)
+            if muted_rules:
+                all_signals = [
+                    s
+                    for s in all_signals
+                    if s.hard_block
+                    or s.category in NON_MUTABLE_CATEGORIES
+                    or str(s.evidence.get("rule_id", "")) not in muted_rules
+                ]
+
         det_score, has_hard_block = self._aggregate_score(
             all_signals,
             raid_state=raid_state,
@@ -132,46 +161,49 @@ class ProtectionEngine:
             strikes=user_rep.strikes if user_rep else 0,
         )
 
-        # Post-evaluation state updates (skipped for dry-run /draft checks)
         if not is_dry_run:
             if result.action == VerdictAction.ALLOW:
                 if user_rep is not None and not event.is_admin:
                     self.reputation.record_clean_interaction(user_rep)
-            else:
-                if user_rep is not None and not event.is_admin:
-                    self.reputation.record_violation(user_rep, result.risk_score, event.timestamp)
-
-                # Escalate Raid State if high-risk violations surge rapidly in groups
-                if (
-                    event.chat_type in {ChatType.GROUP, ChatType.SUPERGROUP}
-                    and result.risk_score >= self.config.thresholds.delete_ban
-                ):
-                    new_raid_state, triggered_lockdown = self.behavioral.record_high_risk_violation(
-                        event.chat_id, event.timestamp
-                    )
-                    result.raid_state = new_raid_state
-                    result.trigger_lockdown = triggered_lockdown
-
-                # Persist Federation Ban for severe / hard-block threats
-                if result.federation_ban and self.config.reputation.federation_sync_enabled:
-                    entity_id = event.sender_chat_id if result.ban_sender_chat else event.user_id
-                    if entity_id is not None:
-                        self.storage.add_federation_ban(
-                            entity_id=entity_id,
-                            reason=result.summary[:180],
-                            category=(
-                                result.primary_category.value
-                                if result.primary_category
-                                else "UNKNOWN"
-                            ),
-                            source_chat_id=event.chat_id,
-                            federation_id=chat_cfg.federation_id,
-                            entity_type="channel" if result.ban_sender_chat else "user",
-                        )
-
                 result.latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-                self._persist_incident(event, result, norm.cleaned)
+                self.metrics.record_evaluation(blocked=False, latency_ms=result.latency_ms)
                 return result
+
+            if user_rep is not None and not event.is_admin:
+                self.reputation.record_violation(user_rep, result.risk_score, event.timestamp)
+
+            if (
+                event.chat_type in {ChatType.GROUP, ChatType.SUPERGROUP}
+                and result.risk_score >= self.config.thresholds.delete_ban
+            ):
+                new_raid_state, triggered_lockdown = self.behavioral.record_high_risk_violation(
+                    event.chat_id, event.timestamp
+                )
+                result.raid_state = new_raid_state
+                result.trigger_lockdown = triggered_lockdown
+                if triggered_lockdown:
+                    self.metrics.lockdowns_triggered += 1
+
+            if result.federation_ban and self.config.reputation.federation_sync_enabled:
+                entity_id = event.sender_chat_id if result.ban_sender_chat else event.user_id
+                if entity_id is not None:
+                    self.storage.add_federation_ban(
+                        entity_id=entity_id,
+                        reason=result.summary[:180],
+                        category=(
+                            result.primary_category.value
+                            if result.primary_category
+                            else "UNKNOWN"
+                        ),
+                        source_chat_id=event.chat_id,
+                        federation_id=chat_cfg.federation_id,
+                        entity_type="channel" if result.ban_sender_chat else "user",
+                    )
+
+            result.latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+            result.incident_id = self._persist_incident(event, result, norm.cleaned)
+            self.metrics.record_evaluation(blocked=True, latency_ms=result.latency_ms)
+            return result
 
         result.latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
         return result
@@ -193,7 +225,6 @@ class ProtectionEngine:
             top_hb = max(s.score for s in hard_blocks)
             return min(100, max(92, top_hb)), True
 
-        # Sort descending: primary signal + diminishing contributions from corroborating signals
         ordered = sorted((s.score for s in signals), reverse=True)
         combined = float(ordered[0])
         if len(ordered) >= 2:
@@ -201,7 +232,6 @@ class ProtectionEngine:
         for extra in ordered[2:]:
             combined += 0.18 * extra
 
-        # Contextual multipliers (never applied to admins)
         if not is_admin:
             if is_sandboxed:
                 combined *= 1.18
@@ -210,7 +240,6 @@ class ProtectionEngine:
             elif raid_state == RaidState.LOCKDOWN:
                 combined *= 1.35
             elif user_trust >= 80 and clean_messages >= 10:
-                # Veteran trust discount reduces false positives for established community members
                 combined *= 0.85
 
         return max(0, min(100, int(round(combined)))), False
@@ -234,7 +263,6 @@ class ProtectionEngine:
             else "Clean — no Telegram ToS threats detected"
         )
 
-        # 1. Pre-Publish Draft Check Mode
         if event.event_type == EventType.DRAFT_CHECK:
             if has_hard_block or risk_score >= th.delete_ban:
                 action = VerdictAction.QUARANTINE_CHANNEL_POST
@@ -251,7 +279,6 @@ class ProtectionEngine:
                 summary=summary,
             )
 
-        # 2. Broadcast Channel Protection Mode (Post-publish & Edited Channel Post Guard)
         if event.chat_type == ChatType.CHANNEL or event.event_type in {
             EventType.CHANNEL_POST,
             EventType.EDITED_CHANNEL_POST,
@@ -287,7 +314,6 @@ class ProtectionEngine:
                 summary=summary,
             )
 
-        # 3. Admin Protection in Groups (Never auto-ban group admins; alert owner & quarantine critical hijacks!)
         if event.is_admin:
             if has_hard_block or risk_score >= 85:
                 return EvaluationResult(
@@ -308,7 +334,6 @@ class ProtectionEngine:
                 summary=summary,
             )
 
-        # 4. Standard Group / Supergroup / Linked Discussion Group Enforcement
         if has_hard_block or risk_score >= th.hard_block_fedban:
             return EvaluationResult(
                 risk_score=risk_score,
@@ -338,7 +363,6 @@ class ProtectionEngine:
             )
 
         if risk_score >= th.delete_restrict:
-            # Escalating mute duration: 1h -> 12h -> 24h
             mute_hours = 1 if strikes == 0 else (12 if strikes == 1 else 24)
             return EvaluationResult(
                 risk_score=risk_score,
@@ -377,9 +401,10 @@ class ProtectionEngine:
 
     def _persist_incident(
         self, event: TelegramEvent, result: EvaluationResult, cleaned_text: str
-    ) -> None:
+    ) -> str:
+        incident_id = uuid.uuid4().hex[:10]
         inc = IncidentRecord(
-            incident_id=uuid.uuid4().hex[:12],
+            incident_id=incident_id,
             timestamp=event.timestamp,
             chat_id=event.chat_id,
             chat_type=event.chat_type.value,
@@ -397,3 +422,4 @@ class ProtectionEngine:
             redacted_preview=redact_pii(cleaned_text, max_len=140),
         )
         self.storage.record_incident(inc)
+        return incident_id

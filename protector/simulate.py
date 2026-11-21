@@ -1,10 +1,12 @@
-"""Red-Team Attack Simulation & Precision/Recall Stress Harness for AegisTG."""
+"""Red-Team Attack Simulation & Precision/Recall/BK-Tree Benchmark Harness for AegisTG v2.0."""
 
 from __future__ import annotations
 
 import asyncio
 import io
+import struct
 import time
+import zlib
 from dataclasses import dataclass
 
 from PIL import Image, ImageDraw
@@ -37,6 +39,20 @@ def _make_flyer_image(color: tuple[int, int, int], variant_border: int = 0) -> b
     return buf.getvalue()
 
 
+def _make_decompression_bomb_header_png(width: int = 10000, height: int = 10000) -> bytes:
+    """Craft a tiny valid PNG header claiming 100MP dimensions (exceeds 25MP safe cap!)."""
+    sig = b"\x89PNG\r\n\x1a\n"
+    ihdr_data = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    ihdr = (
+        struct.pack(">I", len(ihdr_data))
+        + b"IHDR"
+        + ihdr_data
+        + struct.pack(">I", zlib.crc32(b"IHDR" + ihdr_data) & 0xFFFFFFFF)
+    )
+    iend = struct.pack(">I", 0) + b"IEND" + struct.pack(">I", zlib.crc32(b"IEND") & 0xFFFFFFFF)
+    return sig + ihdr + iend
+
+
 @dataclass
 class SimResult:
     name: str
@@ -49,7 +65,7 @@ class SimResult:
 
 
 async def run_simulation() -> tuple[list[SimResult], int]:
-    """Execute 15 realistic Telegram attack & benign scenarios end-to-end."""
+    """Execute 18 realistic Telegram attack, DoS & benign scenarios end-to-end."""
     cfg = load_config()
     storage = Storage(":memory:")
     engine = ProtectionEngine(cfg, storage)
@@ -76,14 +92,19 @@ async def run_simulation() -> tuple[list[SimResult], int]:
         )
     )
 
-    # Seed one known banned scam flyer perceptual hash into DB
+    # Seed known scam flyer hash + 500 decoy hashes to benchmark BK-Tree O(log N) speed!
     orig_flyer = _make_flyer_image((200, 30, 30), variant_border=0)
     flyer_hash = compute_dhash(orig_flyer)
     assert flyer_hash is not None
-    storage.add_banned_media_hash(flyer_hash, "SCAM_PHISHING_SAFEGUARD", "Known crypto drainer flyer")
-    # Slightly tweaked variant (shifted border + JPEG recompressed) to prove perceptual matching!
-    tweaked_flyer = _make_flyer_image((195, 35, 32), variant_border=2)
+    engine.media_analyzer.index_banned_hash(
+        flyer_hash, "SCAM_PHISHING_SAFEGUARD", "Known crypto drainer flyer"
+    )
+    for i in range(500):
+        # Spread deterministic synthetic hashes far from flyer_hash
+        decoy = ((i * 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF) ^ 0xAAAAAAAAAAAAAAAA
+        engine.media_analyzer._bk_tree.add(decoy, "SPAM_SHILL_FLOOD", f"decoy-{i}")
 
+    tweaked_flyer = _make_flyer_image((195, 35, 32), variant_border=2)
     base_ts = time.time()
     results: list[SimResult] = []
 
@@ -251,9 +272,9 @@ async def run_simulation() -> tuple[list[SimResult], int]:
         expected_block=True,
     )
 
-    # 9. Modified Scam Flyer Matched via 64-bit Perceptual dHash
+    # 9. Modified Scam Flyer Matched via BK-Tree O(log N) 64-bit dHash
     await _run(
-        "Mutated Scam Flyer (64-bit dHash Match)",
+        "Mutated Scam Flyer (BK-Tree dHash Match)",
         TelegramEvent(
             event_type=EventType.MESSAGE,
             chat_id=group_id,
@@ -266,14 +287,59 @@ async def run_simulation() -> tuple[list[SimResult], int]:
         expected_block=True,
     )
 
-    # 10. Hijacked Admin Posting Phishing Scam in Broadcast Channel (Auto-Quarantine!)
+    # 10. Malicious 100MP PNG Decompression Bomb DoS Attempt
+    await _run(
+        "100MP PNG Decompression-Bomb OOM DoS",
+        TelegramEvent(
+            event_type=EventType.MESSAGE,
+            chat_id=group_id,
+            chat_type=ChatType.SUPERGROUP,
+            timestamp=base_ts + 7.5,
+            message_id=110,
+            user_id=8100000010,
+            media=MediaInfo(media_type="photo", raw_bytes=_make_decompression_bomb_header_png()),
+        ),
+        expected_block=True,
+    )
+
+    # 11. PSL Subdomain Spoof (`telegram.org.evil.co.uk`)
+    await _run(
+        "PSL Subdomain Spoof (telegram.org.co.uk)",
+        TelegramEvent(
+            event_type=EventType.MESSAGE,
+            chat_id=group_id,
+            chat_type=ChatType.SUPERGROUP,
+            timestamp=base_ts + 8,
+            message_id=111,
+            user_id=8100000011,
+            text="Official verification page: https://telegram.org.evil-auth.co.uk/login",
+        ),
+        expected_block=True,
+    )
+
+    # 12. Leetspeak Brand Typosquat (`te1egram-login.xyz`)
+    await _run(
+        "Leetspeak Brand Domain (te1egram-login)",
+        TelegramEvent(
+            event_type=EventType.MESSAGE,
+            chat_id=group_id,
+            chat_type=ChatType.SUPERGROUP,
+            timestamp=base_ts + 8.5,
+            message_id=112,
+            user_id=8100000012,
+            text="Check status here: https://te1egram-login.xyz/session",
+        ),
+        expected_block=True,
+    )
+
+    # 13. Hijacked Admin Posting Phishing Scam in Broadcast Channel (Auto-Quarantine!)
     await _run(
         "Hijacked Admin Posting Scam in Channel",
         TelegramEvent(
             event_type=EventType.CHANNEL_POST,
             chat_id=channel_id,
             chat_type=ChatType.CHANNEL,
-            timestamp=base_ts + 8,
+            timestamp=base_ts + 9,
             message_id=501,
             is_admin=True,
             text="URGENT: Connect your wallet to claim free TON airdrop now at https://t-safeguard.com/claim",
@@ -281,21 +347,21 @@ async def run_simulation() -> tuple[list[SimResult], int]:
         expected_block=True,
     )
 
-    # 11. Pre-Publish Channel /draft DMCA Copyright Risk Warning
+    # 14. Pre-Publish Channel /draft DMCA Copyright Risk Warning
     await _run(
         "Channel /draft DMCA Piracy Warning",
         TelegramEvent(
             event_type=EventType.DRAFT_CHECK,
             chat_id=channel_id,
             chat_type=ChatType.CHANNEL,
-            timestamp=base_ts + 9,
+            timestamp=base_ts + 9.5,
             is_admin=True,
             text="Download HD 1080p free movie & cracked software Adobe Premiere link below!",
         ),
         expected_block=True,
     )
 
-    # 12. Federation Ban Propagation Across Sister Chats (Actor 8100000002 from Test #2 enters new chat!)
+    # 15. Federation Ban Propagation Across Sister Chats (Actor 8100000002 from Test #2)
     await _run(
         "Cross-Chat Federation Ban Propagation",
         TelegramEvent(
@@ -310,7 +376,7 @@ async def run_simulation() -> tuple[list[SimResult], int]:
         expected_block=True,
     )
 
-    # 13. BENIGN: Legitimate Technical Security Discussion (Zero False Positive Check!)
+    # 16. BENIGN: Legitimate Technical Security Discussion (Zero False Positive Check!)
     await _run(
         "BENIGN: Tech Discussion About Telegram ToS",
         TelegramEvent(
@@ -326,7 +392,7 @@ async def run_simulation() -> tuple[list[SimResult], int]:
         expected_block=False,
     )
 
-    # 14. BENIGN: Natural Bengali Community Message (Zero False Positive Check!)
+    # 17. BENIGN: Natural Bengali Community Message (Zero False Positive Check!)
     await _run(
         "BENIGN: Normal Bengali Community Greeting",
         TelegramEvent(
@@ -342,7 +408,7 @@ async def run_simulation() -> tuple[list[SimResult], int]:
         expected_block=False,
     )
 
-    # 15. BENIGN: Clean Channel Announcement Draft
+    # 18. BENIGN: Clean Channel Announcement Draft
     await _run(
         "BENIGN: Clean Channel Release Announcement",
         TelegramEvent(
@@ -356,7 +422,6 @@ async def run_simulation() -> tuple[list[SimResult], int]:
         expected_block=False,
     )
 
-    # Bonus: Verify Security Posture Auditor on the simulated Channel
     auditor = SecurityAuditor(storage)
     audit = auditor.audit_chat_metadata(
         chat_info={
@@ -387,9 +452,9 @@ async def run_simulation() -> tuple[list[SimResult], int]:
 def main() -> int:
     results, audit_score = asyncio.run(run_simulation())
     passed = 0
-    print("=" * 94)
-    print(" AegisTG Red-Team Security Simulation & Zero-False-Positive Benchmark")
-    print("=" * 94)
+    print("=" * 98)
+    print(" AegisTG v2.0 Red-Team Security Simulation & Zero-False-Positive Benchmark (501-Hash BK-Tree)")
+    print("=" * 98)
     for idx, r in enumerate(results, 1):
         ok = r.blocked == r.expected_block
         if ok:
@@ -397,16 +462,16 @@ def main() -> int:
         mark = "PASS" if ok else "FAIL"
         exp = "BLOCK" if r.expected_block else "ALLOW"
         print(
-            f"{idx:2d}. [{mark}] {r.name:<43} | exp={exp:<5} | score={r.risk_score:3d} "
+            f"{idx:2d}. [{mark}] {r.name:<45} | exp={exp:<5} | score={r.risk_score:3d} "
             f"| {r.action:<23} | {r.latency_ms:5.2f}ms"
         )
-    print("-" * 94)
+    print("-" * 98)
     avg_lat = sum(r.latency_ms for r in results) / len(results)
     print(
         f"Scorecard: {passed}/{len(results)} scenarios passed | "
         f"Avg Latency: {avg_lat:.2f} ms | Sample Channel Audit Score: {audit_score}/100"
     )
-    print("=" * 94)
+    print("=" * 98)
     return 0 if passed == len(results) else 1
 
 

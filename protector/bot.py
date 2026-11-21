@@ -1,4 +1,4 @@
-"""AegisTG Bot Update Router, Enforcement Executor & Admin Command Controller."""
+"""AegisTG v2.0 Bot Update Router, Native UX Controller, Self-Healing Triage & Action Executor."""
 
 from __future__ import annotations
 
@@ -9,11 +9,12 @@ import logging
 import time
 from typing import Any
 
-from protector.analyzers.media_guard import compute_dhash
+from protector.analyzers.media_guard import DecompressionBombDetected, compute_dhash
 from protector.auditor import SecurityAuditor
 from protector.config import BotConfig
 from protector.engine import ProtectionEngine
 from protector.models import (
+    ChatConfig,
     ChatType,
     EntityInfo,
     EvaluationResult,
@@ -23,8 +24,21 @@ from protector.models import (
     TelegramEvent,
     VerdictAction,
 )
+from protector.security import CallbackSigner, RuntimeMetrics
 from protector.storage import Storage
 from protector.telegram_client import TelegramAPIClient, TelegramAPIError
+from protector.ui import (
+    EFFECT_CELEBRATION,
+    build_emoji_captcha,
+    render_audit_card,
+    render_control_panel,
+    render_digest_card,
+    render_draft_card,
+    render_inline_scan_result,
+    render_native_chat_picker_keyboard,
+    render_owner_alert_card,
+    render_welcome_card,
+)
 
 logger = logging.getLogger("aegistg.bot")
 
@@ -37,7 +51,32 @@ ALLOWED_UPDATES: list[str] = [
     "my_chat_member",
     "chat_join_request",
     "callback_query",
+    "inline_query",
 ]
+
+DEFAULT_GROUP_ADMIN_RIGHTS: dict[str, bool] = {
+    "is_anonymous": False,
+    "can_manage_chat": True,
+    "can_delete_messages": True,
+    "can_restrict_members": True,
+    "can_invite_users": True,
+    "can_promote_members": False,
+    "can_change_info": False,
+    "can_pin_messages": False,
+    "can_manage_video_chats": False,
+}
+
+DEFAULT_CHANNEL_ADMIN_RIGHTS: dict[str, bool] = {
+    "is_anonymous": False,
+    "can_manage_chat": True,
+    "can_post_messages": True,
+    "can_edit_messages": True,
+    "can_delete_messages": True,
+    "can_invite_users": True,
+    "can_manage_direct_messages": True,
+    "can_promote_members": False,
+    "can_change_info": False,
+}
 
 LOCKDOWN_PERMISSIONS: dict[str, bool] = {
     "can_send_messages": False,
@@ -68,9 +107,22 @@ MUTED_USER_PERMISSIONS: dict[str, bool] = {
     "can_add_web_page_previews": False,
 }
 
+RESTORED_USER_PERMISSIONS: dict[str, bool] = {
+    "can_send_messages": True,
+    "can_send_audios": True,
+    "can_send_documents": True,
+    "can_send_photos": True,
+    "can_send_videos": True,
+    "can_send_video_notes": True,
+    "can_send_voice_notes": True,
+    "can_send_polls": True,
+    "can_send_other_messages": False,
+    "can_add_web_page_previews": False,
+}
+
 
 class AegisTGBot:
-    """Main asynchronous Telegram Group & Channel Protection Bot."""
+    """Main asynchronous Telegram Group & Channel Protection Bot (v2.0)."""
 
     def __init__(
         self,
@@ -79,65 +131,133 @@ class AegisTGBot:
         client: TelegramAPIClient | None = None,
     ) -> None:
         self.config = config
+        self.metrics = RuntimeMetrics()
         self.storage = storage or Storage(config.database_path)
         self.client = client or TelegramAPIClient(
             bot_token=config.bot_token,
             api_base_url=config.api_base_url,
             rate_limits=config.rate_limits,
+            metrics=self.metrics,
         )
-        self.engine = ProtectionEngine(config, self.storage)
+        self.engine = ProtectionEngine(config, self.storage, metrics=self.metrics)
         self.auditor = SecurityAuditor(self.storage)
+        self.signer = CallbackSigner(config.webhook_secret_token or config.bot_token or None)
 
         self.bot_user_id: int = 0
         self.bot_username: str = ""
         # Cache chat admin IDs with 120s TTL: chat_id -> (expires_at, set[user_id])
         self._admin_cache: dict[int, tuple[float, set[int]]] = {}
+        # Track pending captcha auto-cleanup tasks: (chat_id, user_id) -> Task
+        self._pending_captchas: dict[tuple[int, int], asyncio.Task[None]] = {}
         self._running = False
 
     async def initialize(self) -> None:
+        """Configure native Bot API profile, default admin rights, and role-scoped command menus."""
         me = await self.client.get_me()
         self.bot_user_id = int(me["id"])
         self.bot_username = str(me.get("username", ""))
-        await self.client.set_my_commands(
-            [
-                {"command": "status", "description": "Protection status & 24h threat summary"},
-                {"command": "audit", "description": "Run 0-100 Group/Channel Security Posture Audit"},
-                {"command": "draft", "description": "Pre-publish Channel compliance scan"},
-                {"command": "lockdown", "description": "Activate emergency anti-raid lockdown"},
-                {"command": "unlock", "description": "Lift lockdown and restore chat permissions"},
-                {"command": "strict_channel", "description": "Toggle auto-quarantine for channel posts"},
-                {"command": "allow_domain", "description": "Whitelist a trusted domain for this chat"},
-                {"command": "set_alert_chat", "description": "Route security alerts to this chat"},
-                {"command": "export_audit", "description": "Export compliance proof for abuse@telegram.org"},
-                {"command": "privacy", "description": "View Bot Privacy Policy (Telegram ToS Sec 4)"},
-            ]
-        )
-        logger.info("AegisTG initialized as @%s (id=%s)", self.bot_username, self.bot_user_id)
+
+        # 1. Pre-fill exact least-privilege admin rights for startgroup & startchannel onboarding
+        try:
+            await self.client.set_my_default_administrator_rights(
+                DEFAULT_GROUP_ADMIN_RIGHTS, for_channels=False
+            )
+            await self.client.set_my_default_administrator_rights(
+                DEFAULT_CHANNEL_ADMIN_RIGHTS, for_channels=True
+            )
+        except TelegramAPIError as exc:
+            logger.debug("Optional setMyDefaultAdministratorRights skipped: %s", exc)
+
+        # 2. Polish native Telegram bot profile description
+        try:
+            await self.client.set_my_short_description(
+                "🛡 9-Layer Telegram Group & Channel Protector — Anti-Raid, Edit-Bait, Scam, Malware & Audit Shield."
+            )
+            await self.client.set_my_description(
+                "AegisTG protects Telegram Groups, Linked Discussion Groups, and Broadcast Channels from bans, "
+                "raids, delayed edit-bait sabotage, phishing, malware, and admin hijacks — with zero clutter "
+                "and strict Telegram Terms of Service & Privacy compliance."
+            )
+        except TelegramAPIError as exc:
+            logger.debug("Optional setMyDescription skipped: %s", exc)
+
+        # 3. Role-Scoped Command Menus (Clean UX: members vs admins vs DM!)
+        dm_commands = [
+            {"command": "start", "description": "🚀 Onboarding wizard & quick setup"},
+            {"command": "panel", "description": "🎛 Interactive Control Center Dashboard"},
+            {"command": "connect", "description": "🔗 Native Group/Channel & Alert Chat Picker"},
+            {"command": "draft", "description": "🧪 Pre-publish Channel Compliance Scan"},
+            {"command": "privacy", "description": "🔒 Bot Privacy Policy (ToS Sec 4)"},
+        ]
+        member_group_commands = [
+            {"command": "privacy", "description": "🔒 View Bot Privacy Policy"},
+            {"command": "help", "description": "ℹ️ About AegisTG Protection"},
+        ]
+        admin_group_commands = [
+            {"command": "panel", "description": "🎛 Live Interactive Control Center"},
+            {"command": "audit", "description": "🔍 Run 0-100 Security Posture Audit"},
+            {"command": "digest", "description": "📈 7-Day Community Protection Digest"},
+            {"command": "status", "description": "⚡ Live Raid State & 24h Telemetry"},
+            {"command": "draft", "description": "🧪 Pre-publish Channel Compliance Scan"},
+            {"command": "lockdown", "description": "🚨 Activate Emergency Anti-Raid Lockdown"},
+            {"command": "unlock", "description": "🔓 Lift Lockdown & Restore Permissions"},
+            {"command": "strict_channel", "description": "🛡 Toggle Channel Auto-Quarantine"},
+            {"command": "ban_media", "description": "🖼 Ban Scam Image Perceptual Hash (dHash)"},
+            {"command": "allow_domain", "description": "✅ Whitelist Trusted Domain"},
+            {"command": "set_alert_chat", "description": "📡 Route Security Alerts Here"},
+            {"command": "export_audit", "description": "📄 Export Proof for abuse@telegram.org"},
+        ]
+
+        try:
+            await self.client.set_my_commands(dm_commands, scope={"type": "all_private_chats"})
+            await self.client.set_my_commands(member_group_commands, scope={"type": "all_group_chats"})
+            await self.client.set_my_commands(
+                admin_group_commands, scope={"type": "all_chat_administrators"}
+            )
+        except TelegramAPIError:
+            await self.client.set_my_commands(admin_group_commands)
+
+        logger.info("AegisTG v2.0 initialized as @%s (id=%s)", self.bot_username, self.bot_user_id)
+
+    async def shutdown(self) -> None:
+        """Gracefully drain queues, cancel timers, checkpoint WAL, and close pools."""
+        self._running = False
+        for task in list(self._pending_captchas.values()):
+            task.cancel()
+        self._pending_captchas.clear()
+        await self.client.close()
+        self.storage.close()
+        logger.info("AegisTG shutdown complete.")
 
     async def run_polling(self) -> None:
         await self.initialize()
         await self.client.delete_webhook(drop_pending_updates=False)
         self._running = True
         offset: int | None = None
-        last_prune = time.time()
+        last_maintenance = time.time()
         logger.info("Starting Long Polling with allowed_updates=%s", ALLOWED_UPDATES)
 
-        while self._running:
-            try:
-                updates = await self.client.get_updates(
-                    offset=offset, timeout=25, allowed_updates=ALLOWED_UPDATES
-                )
-                for upd in updates:
-                    offset = int(upd["update_id"]) + 1
-                    asyncio.create_task(self.handle_update(upd))
-                if time.time() - last_prune > 3600:
-                    self.storage.prune_expired_snapshots(self.config.edit_bait.snapshot_ttl_days)
-                    last_prune = time.time()
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                logger.exception("Polling loop error: %s", exc)
-                await asyncio.sleep(2.0)
+        try:
+            while self._running:
+                try:
+                    updates = await self.client.get_updates(
+                        offset=offset, timeout=25, allowed_updates=ALLOWED_UPDATES
+                    )
+                    for upd in updates:
+                        offset = int(upd["update_id"]) + 1
+                        asyncio.create_task(self.handle_update(upd))
+                    if time.time() - last_maintenance > 3600:
+                        self.storage.prune_expired_data(
+                            snapshot_ttl_days=self.config.edit_bait.snapshot_ttl_days
+                        )
+                        last_maintenance = time.time()
+                except asyncio.CancelledError:
+                    break
+                except Exception as exc:
+                    logger.exception("Polling loop error: %s", exc)
+                    await asyncio.sleep(2.0)
+        finally:
+            await self.shutdown()
 
     def stop(self) -> None:
         self._running = False
@@ -147,6 +267,10 @@ class AegisTGBot:
     # ------------------------------------------------------------------
     async def handle_update(self, update: dict[str, Any]) -> EvaluationResult | None:
         try:
+            if "inline_query" in update:
+                await self._handle_inline_query(update["inline_query"])
+                return None
+
             if "chat_join_request" in update:
                 await self._handle_join_request(update["chat_join_request"])
                 return None
@@ -176,6 +300,46 @@ class AegisTGBot:
         return None
 
     # ------------------------------------------------------------------
+    # Inline Security Scanner (`@BotName <url or draft text>`)
+    # ------------------------------------------------------------------
+    async def _handle_inline_query(self, iq: dict[str, Any]) -> None:
+        iq_id = str(iq["id"])
+        query = str(iq.get("query") or "").strip()
+        if len(query) < 4:
+            await self.client.answer_inline_query(
+                iq_id,
+                results=[
+                    {
+                        "type": "article",
+                        "id": "hint",
+                        "title": "🛡 AegisTG Instant Security Scanner",
+                        "description": "Type or paste any URL or channel draft post to scan for scams, phishing, or DMCA risk.",
+                        "input_message_content": {
+                            "message_text": "🛡 Use <code>@"
+                            + html.escape(self.bot_username or "AegisTGBot")
+                            + " &lt;url or draft&gt;</code> to scan links or channel posts inline!",
+                            "parse_mode": "HTML",
+                        },
+                    }
+                ],
+                cache_time=60,
+            )
+            return
+
+        ev = TelegramEvent(
+            event_type=EventType.DRAFT_CHECK,
+            chat_id=0,
+            chat_type=ChatType.CHANNEL,
+            timestamp=time.time(),
+            text=query,
+            is_admin=False,
+        )
+        res = await self.engine.evaluate(ev)
+        self.metrics.inline_scans += 1
+        articles = render_inline_scan_result(query, res)
+        await self.client.answer_inline_query(iq_id, results=articles, cache_time=10)
+
+    # ------------------------------------------------------------------
     # Message / Edited Message / Channel Post Handler
     # ------------------------------------------------------------------
     async def _handle_message_like(
@@ -185,33 +349,35 @@ class AegisTGBot:
         chat_id = int(chat["id"])
         chat_type = ChatType(chat.get("type", "private"))
 
-        # Ensure chat is registered in storage
+        # Handle Native Telegram KeyboardButtonRequestChat (`chat_shared`) binding!
+        if "chat_shared" in msg and chat_type == ChatType.PRIVATE:
+            await self._handle_chat_shared(msg)
+            return None
+
+        # Register / keep chat title synchronized
         chat_cfg = self.storage.get_chat_config(chat_id)
-        if chat_cfg.title != chat.get("title", "") and chat.get("title"):
-            chat_cfg.title = chat["title"]
+        if chat.get("title") and (chat_cfg.title != chat.get("title") or chat_cfg.chat_type != chat_type.value):
+            chat_cfg.title = str(chat["title"])
             chat_cfg.chat_type = chat_type.value
             self.storage.upsert_chat_config(chat_cfg)
 
-        # Handle commands first (only on non-edited messages)
         text = msg.get("text") or msg.get("caption") or ""
         if event_type == EventType.MESSAGE and text.startswith("/"):
             handled = await self._handle_command(msg, text)
             if handled:
                 return None
 
-        # Ignore private chat non-command messages (treat as draft check if sent to bot DM!)
+        # Private DM non-command messages -> Instant Pre-Publish Compliance Scan!
         if chat_type == ChatType.PRIVATE:
             if text.strip():
                 await self._run_draft_check(chat_id, msg.get("message_id"), text, msg)
             return None
 
-        # Ignore messages sent by the bot itself
         from_user = msg.get("from") or {}
         user_id = from_user.get("id")
         if user_id is not None and int(user_id) == self.bot_user_id:
             return None
 
-        # Check admin status for group messages
         is_admin = False
         is_anon_admin = False
         sender_chat = msg.get("sender_chat") or {}
@@ -225,11 +391,9 @@ class AegisTGBot:
         elif chat_type == ChatType.CHANNEL:
             is_admin = True
 
-        # Parse media & optionally download small media bytes for magic-byte / perceptual dHash
         media = await self._parse_media(msg)
-
-        # Build unified TelegramEvent
         entities = self._parse_entities(msg.get("entities") or msg.get("caption_entities") or [])
+
         event = TelegramEvent(
             event_type=event_type,
             chat_id=chat_id,
@@ -256,12 +420,49 @@ class AegisTGBot:
             raw_update=msg,
         )
 
-        # Evaluate through the 9-Layer Protection Engine
         result = await self.engine.evaluate(event)
-
-        # Execute Enforcement Plan
         await self._execute_verdict(event, result)
         return result
+
+    async def _handle_chat_shared(self, msg: dict[str, Any]) -> None:
+        dm_chat_id = int(msg["chat"]["id"])
+        shared = msg["chat_shared"]
+        req_id = int(shared.get("request_id", 0))
+        target_chat_id = int(shared["chat_id"])
+        target_title = str(shared.get("title") or target_chat_id)
+
+        if req_id == 103:
+            # Bind as global/default Owner Alert Chat for all chats managed by this owner!
+            self.config.owner_alert_chat_id = target_chat_id
+            for c in self.storage.list_chat_configs(enabled_only=True):
+                if c.alert_chat_id is None:
+                    c.alert_chat_id = target_chat_id
+                    self.storage.upsert_chat_config(c)
+            await self.client.send_message(
+                dm_chat_id,
+                f"✅ <b>Owner Alert Chat Bound!</b>\n"
+                f"Security incidents &amp; hijack alerts will route to <b>{html.escape(target_title)}</b> "
+                f"(<code>{target_chat_id}</code>).",
+                reply_markup={"remove_keyboard": True},
+            )
+            return
+
+        # req_id 101 (Channel) or 102 (Group): register & open Control Center immediately!
+        cfg = self.storage.get_chat_config(target_chat_id)
+        cfg.title = target_title
+        cfg.chat_type = "channel" if req_id == 101 else "supergroup"
+        cfg.enabled = True
+        self.storage.upsert_chat_config(cfg)
+
+        raid = self.engine.behavioral.get_raid_state(target_chat_id, time.time())
+        stats = self.storage.get_chat_stats(target_chat_id, window_seconds=86400)
+        prec = self.storage.get_precision_metrics(target_chat_id)
+        text, markup = render_control_panel(cfg, raid, stats, prec, self.signer, tab="overview")
+        await self.client.send_message(
+            dm_chat_id,
+            f"✅ Connected <b>{html.escape(target_title)}</b>!\n\n{text}",
+            reply_markup=markup,
+        )
 
     async def _execute_verdict(self, event: TelegramEvent, result: EvaluationResult) -> None:
         if result.action == VerdictAction.ALLOW:
@@ -270,7 +471,6 @@ class AegisTGBot:
         chat_id = event.chat_id
         msg_id = event.message_id
 
-        # 1. Delete Violating Message / Quarantine Channel Post
         if msg_id is not None and result.action in {
             VerdictAction.DELETE_ONLY,
             VerdictAction.DELETE_RESTRICT,
@@ -280,14 +480,12 @@ class AegisTGBot:
         }:
             await self.client.queue_delete_message(chat_id, msg_id)
 
-        # 2. Ban Spoofed Sender Channel (banChatSenderChat)
         if result.ban_sender_chat and event.sender_chat_id is not None:
             try:
                 await self.client.ban_chat_sender_chat(chat_id, event.sender_chat_id)
             except TelegramAPIError as exc:
                 logger.warning("Failed banChatSenderChat(%s, %s): %s", chat_id, event.sender_chat_id, exc)
 
-        # 3. Ban or Restrict Offending User
         elif event.user_id is not None and not event.is_admin:
             if result.action in {VerdictAction.DELETE_BAN, VerdictAction.HARD_BLOCK_FEDBAN}:
                 try:
@@ -309,21 +507,18 @@ class AegisTGBot:
                 except TelegramAPIError as exc:
                     logger.warning("Failed restrictChatMember(%s, %s): %s", chat_id, event.user_id, exc)
 
-        # 4. Trigger Automatic Anti-Raid Lockdown if Violation Threshold Breached
         if result.trigger_lockdown and event.chat_type in {ChatType.GROUP, ChatType.SUPERGROUP}:
             await self._activate_lockdown(chat_id, reason="Automatic anti-raid violation threshold breached")
 
-        # 5. Send Real-Time Owner Security Alert Card
         if result.alert_owner or result.trigger_lockdown:
             await self._send_owner_alert(event, result)
 
     # ------------------------------------------------------------------
-    # Raid Lockdown & Permission Snapshot/Restore
+    # Raid Lockdown & Exact Permission Snapshot/Restore
     # ------------------------------------------------------------------
     async def _activate_lockdown(self, chat_id: int, reason: str) -> None:
         cfg = self.storage.get_chat_config(chat_id)
         try:
-            # Snapshot original ChatPermissions before restricting so /unlock restores exact settings!
             if not cfg.saved_permissions_json:
                 info = await self.client.get_chat(chat_id)
                 if info.get("permissions"):
@@ -335,10 +530,21 @@ class AegisTGBot:
             logger.warning("LOCKDOWN activated in chat %s: %s", chat_id, reason)
             await self._notify_alert_chat(
                 chat_id,
-                f"<b>EMERGENCY RAID LOCKDOWN ACTIVATED</b>\n"
+                f"🚨 <b>EMERGENCY RAID LOCKDOWN ACTIVATED</b>\n"
                 f"Chat ID: <code>{chat_id}</code>\n"
                 f"Reason: {html.escape(reason)}\n"
-                f"Group switched to read-only. Use <code>/unlock</code> when the raid subsides.",
+                f"Group switched to read-only. Tap below or run <code>/unlock</code> when safe.",
+                reply_markup={
+                    "inline_keyboard": [
+                        [
+                            {
+                                "text": "🔓 Lift Lockdown & Restore Permissions",
+                                "callback_data": self.signer.sign("raid", f"unlock:{chat_id}"),
+                                "style": "success",
+                            }
+                        ]
+                    ]
+                },
             )
         except TelegramAPIError as exc:
             logger.warning("Failed to activate lockdown in chat %s: %s", chat_id, exc)
@@ -348,18 +554,7 @@ class AegisTGBot:
         restored = (
             json.loads(cfg.saved_permissions_json)
             if cfg.saved_permissions_json
-            else {
-                "can_send_messages": True,
-                "can_send_photos": True,
-                "can_send_videos": True,
-                "can_send_documents": True,
-                "can_send_audios": True,
-                "can_send_voice_notes": True,
-                "can_send_video_notes": True,
-                "can_send_polls": True,
-                "can_send_other_messages": False,
-                "can_add_web_page_previews": False,
-            }
+            else RESTORED_USER_PERMISSIONS
         )
         try:
             await self.client.set_chat_permissions(chat_id, restored)
@@ -373,7 +568,7 @@ class AegisTGBot:
             return False
 
     # ------------------------------------------------------------------
-    # Join Requests & Membership / Admin Change Watchdog
+    # Emoji-Matrix Join Request Gate & Membership Watchdog
     # ------------------------------------------------------------------
     async def _handle_join_request(self, req: dict[str, Any]) -> None:
         chat = req.get("chat") or {}
@@ -387,7 +582,6 @@ class AegisTGBot:
         if triggered_lockdown:
             await self._activate_lockdown(chat_id, reason="Massive join-request flood detected")
 
-        # 1. Instant Decline if Federation-Banned or during active LOCKDOWN
         if self.storage.get_federation_ban(user_id, cfg.federation_id):
             await self.client.decline_chat_join_request(chat_id, user_id)
             return
@@ -395,60 +589,303 @@ class AegisTGBot:
             await self.client.decline_chat_join_request(chat_id, user_id)
             return
 
-        # 2. Check CAS if enabled
         if self.config.reputation.cas_enabled:
             is_cas = await self.engine.reputation._check_cas(user_id)
             if is_cas:
                 await self.client.decline_chat_join_request(chat_id, user_id)
                 return
 
-        # 3. Interactive Verification Gate or Auto-Approve
         if cfg.require_join_verification or raid_state == RaidState.ELEVATED:
             user_chat_id = int(req.get("user_chat_id") or user_id)
+            cap_text, cap_markup, _ = build_emoji_captcha(
+                chat_id=chat_id,
+                chat_title=str(chat.get("title", "this community")),
+                user_id=user_id,
+                signer=self.signer,
+            )
             try:
-                await self.client.send_message(
-                    chat_id=user_chat_id,
-                    text=(
-                        f"<b>Anti-Raid Verification</b>\n"
-                        f"Tap below to verify you are human and join <b>{html.escape(chat.get('title', 'this group'))}</b>."
-                    ),
-                    reply_markup={
-                        "inline_keyboard": [
-                            [
-                                {
-                                    "text": "Verify & Join",
-                                    "callback_data": f"verify:{chat_id}:{user_id}",
-                                }
-                            ]
-                        ]
-                    },
+                sent = await self.client.send_message(
+                    chat_id=user_chat_id, text=cap_text, reply_markup=cap_markup
+                )
+                self._schedule_captcha_timeout(
+                    chat_id, user_id, user_chat_id, sent.get("message_id") if isinstance(sent, dict) else None
                 )
             except TelegramAPIError:
                 pass
         else:
             await self.client.approve_chat_join_request(chat_id, user_id)
 
+    def _schedule_captcha_timeout(
+        self, chat_id: int, user_id: int, dm_chat_id: int, prompt_msg_id: int | None, timeout_s: float = 90.0
+    ) -> None:
+        key = (chat_id, user_id)
+        old = self._pending_captchas.pop(key, None)
+        if old:
+            old.cancel()
+
+        async def _expire() -> None:
+            try:
+                await asyncio.sleep(timeout_s)
+                await self.client.decline_chat_join_request(chat_id, user_id)
+                if prompt_msg_id:
+                    await self.client.queue_delete_message(dm_chat_id, prompt_msg_id)
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            finally:
+                self._pending_captchas.pop(key, None)
+
+        self._pending_captchas[key] = asyncio.create_task(_expire())
+
+    # ------------------------------------------------------------------
+    # Signed Interactive Callback Router (Zero Forgery + Server-Side Admin Auth!)
+    # ------------------------------------------------------------------
     async def _handle_callback_query(self, cb: dict[str, Any]) -> None:
-        data = str(cb.get("data") or "")
+        raw_data = str(cb.get("data") or "")
         from_user = cb.get("from") or {}
+        caller_id = int(from_user["id"])
         cb_id = str(cb["id"])
-        if data.startswith("verify:"):
-            parts = data.split(":")
-            if len(parts) == 3:
-                target_chat = int(parts[1])
-                expected_user = int(parts[2])
-                if int(from_user["id"]) == expected_user:
-                    try:
-                        await self.client.approve_chat_join_request(target_chat, expected_user)
-                        await self.client.answer_callback_query(cb_id, "Verified! Welcome aboard.")
-                        return
-                    except TelegramAPIError:
-                        await self.client.answer_callback_query(
-                            cb_id, "Request already processed or expired.", show_alert=True
+        cb_msg = cb.get("message") or {}
+        cb_chat_id = int((cb_msg.get("chat") or {}).get("id", 0))
+        cb_msg_id = cb_msg.get("message_id")
+
+        verified = self.signer.verify(raw_data, ttl_seconds=86400 * 7)
+        if verified is None:
+            await self.client.answer_callback_query(
+                cb_id, "Expired or invalid security token. Please re-open the menu.", show_alert=True
+            )
+            return
+
+        action, payload = verified
+
+        # 1. Emoji-Matrix Captcha Verification (`cap:<chat_id>:<user_id>:<1|0>`)
+        if action == "cap":
+            parts = payload.split(":")
+            if len(parts) != 3:
+                await self.client.answer_callback_query(cb_id, "Malformed challenge.", show_alert=True)
+                return
+            target_chat, expected_uid, is_correct = int(parts[0]), int(parts[1]), parts[2] == "1"
+            if caller_id != expected_uid:
+                await self.client.answer_callback_query(cb_id, "This challenge belongs to another user.", show_alert=True)
+                return
+
+            timer = self._pending_captchas.pop((target_chat, expected_uid), None)
+            if timer:
+                timer.cancel()
+
+            if is_correct:
+                try:
+                    await self.client.approve_chat_join_request(target_chat, expected_uid)
+                    await self.client.answer_callback_query(cb_id, "✅ Verified! Welcome aboard.")
+                    if cb_chat_id and cb_msg_id:
+                        await self.client.edit_message_text(
+                            cb_chat_id, cb_msg_id, "✅ <b>Verification Passed!</b> Your join request has been approved."
                         )
-                        return
+                except TelegramAPIError:
+                    await self.client.answer_callback_query(cb_id, "Request already handled.", show_alert=True)
+            else:
+                try:
+                    await self.client.decline_chat_join_request(target_chat, expected_uid)
+                except TelegramAPIError:
+                    pass
+                await self.client.answer_callback_query(cb_id, "❌ Wrong emoji. Request declined.", show_alert=True)
+                if cb_chat_id and cb_msg_id:
+                    await self.client.edit_message_text(
+                        cb_chat_id, cb_msg_id, "❌ <b>Verification Failed.</b> Please re-request joining if you are human."
+                    )
+            return
+
+        # 2. Onboarding Home Buttons (`home:<chats|picker|privacy>`)
+        if action == "home":
+            if payload == "picker":
+                await self.client.answer_callback_query(cb_id)
+                await self.client.send_message(
+                    cb_chat_id,
+                    "🔗 <b>Native Chat &amp; Channel Picker</b>\nTap a button below to bind your Group, Channel, or Owner Alert Chat:",
+                    reply_markup=render_native_chat_picker_keyboard(),
+                )
+            elif payload == "privacy":
+                await self.client.answer_callback_query(cb_id)
+                await self.client.send_message(
+                    cb_chat_id,
+                    f"🔒 <b>AegisTG Privacy Policy (ToS Sec 4 Compliant)</b>\n"
+                    f"• Transient in-memory content inspection only.\n"
+                    f"• Zero data scraping or AI/ML model training.\n"
+                    f"• Edit-bait hashes auto-expire after {self.config.edit_bait.snapshot_ttl_days} days.\n"
+                    f"• Full Policy: {html.escape(self.config.privacy_policy_url)}",
+                )
+            elif payload == "chats":
+                chats = self.storage.list_chat_configs(enabled_only=True)
+                await self.client.answer_callback_query(cb_id)
+                if not chats:
+                    await self.client.send_message(
+                        cb_chat_id,
+                        "No protected groups or channels registered yet! Add AegisTG as Admin or tap <b>Native Chat Picker</b>.",
+                    )
+                else:
+                    cfg = chats[0]
+                    await self._render_panel_in_place(cb_chat_id, cb_msg_id, cfg.chat_id, tab="overview")
+            return
+
+        # All remaining actions are privileged — verify admin authorization on the target chat!
+        if action == "tab":
+            tab, cid_str = payload.split(":", 1)
+            target_chat = int(cid_str)
+            if not await self._can_manage_chat(target_chat, caller_id):
+                await self.client.answer_callback_query(cb_id, "Admin permission required.", show_alert=True)
+                return
+            await self.client.answer_callback_query(cb_id)
+            await self._render_panel_in_place(cb_chat_id, cb_msg_id, target_chat, tab=tab)
+            return
+
+        if action == "tog":
+            setting, cid_str = payload.split(":", 1)
+            target_chat = int(cid_str)
+            if not await self._can_manage_chat(target_chat, caller_id):
+                await self.client.answer_callback_query(cb_id, "Admin permission required.", show_alert=True)
+                return
+            cfg = self.storage.get_chat_config(target_chat)
+            if setting == "strict":
+                cfg.strict_channel_guard = not cfg.strict_channel_guard
+                note = f"Strict Channel Guard: {'ON' if cfg.strict_channel_guard else 'OFF'}"
+            else:
+                cfg.require_join_verification = not cfg.require_join_verification
+                note = f"Emoji Join Gate: {'ON' if cfg.require_join_verification else 'OFF'}"
+            self.storage.upsert_chat_config(cfg)
+            await self.client.answer_callback_query(cb_id, f"✅ {note}")
+            await self._render_panel_in_place(cb_chat_id, cb_msg_id, target_chat, tab="overview")
+            return
+
+        if action == "raid":
+            mode, cid_str = payload.split(":", 1)
+            target_chat = int(cid_str)
+            if not await self._can_manage_chat(target_chat, caller_id):
+                await self.client.answer_callback_query(cb_id, "Admin permission required.", show_alert=True)
+                return
+            if mode == "lock":
+                await self._activate_lockdown(target_chat, reason=f"Admin {caller_id} panel lockdown")
+                await self.client.answer_callback_query(cb_id, "🚨 Emergency Lockdown ACTIVATED!")
+            else:
+                ok = await self._lift_lockdown(target_chat)
+                await self.client.answer_callback_query(
+                    cb_id, "🔓 Lockdown lifted & permissions restored!" if ok else "Could not restore permissions."
+                )
+            await self._render_panel_in_place(cb_chat_id, cb_msg_id, target_chat, tab="overview")
+            return
+
+        if action == "audit":
+            target_chat = int(payload)
+            if not await self._can_manage_chat(target_chat, caller_id):
+                await self.client.answer_callback_query(cb_id, "Admin permission required.", show_alert=True)
+                return
+            await self.client.answer_callback_query(cb_id, "🔍 Running live Security Audit...")
+            try:
+                info = await self.client.get_chat(target_chat)
+                admins = await self.client.get_chat_administrators(target_chat)
+                cfg = self.storage.get_chat_config(target_chat)
+                report = self.auditor.audit_chat_metadata(info, admins, self.bot_user_id, cfg)
+                text, markup = render_audit_card(report, self.signer)
+                if cb_chat_id and cb_msg_id:
+                    await self.client.edit_message_text(cb_chat_id, cb_msg_id, text, reply_markup=markup)
+            except TelegramAPIError as exc:
+                await self.client.answer_callback_query(cb_id, f"Audit failed: {exc.description[:80]}", show_alert=True)
+            return
+
+        # 3. Self-Healing Owner Triage Callbacks (`tri:ok|fp|fb:...`)
+        if action == "tri":
+            parts = payload.split(":")
+            kind = parts[0]
+            inc_id = parts[1]
+            target_chat = int(parts[2])
+            if not await self._can_manage_chat(target_chat, caller_id):
+                await self.client.answer_callback_query(cb_id, "Admin permission required.", show_alert=True)
+                return
+
+            if kind == "ok":
+                self.storage.record_incident_feedback(inc_id, target_chat, "CONFIRMED", caller_id)
+                await self.client.answer_callback_query(cb_id, "✅ Threat confirmed in precision ledger.")
+                if cb_chat_id and cb_msg_id:
+                    await self.client.edit_message_text(
+                        cb_chat_id,
+                        cb_msg_id,
+                        f"✅ <b>Incident <code>#{inc_id}</code> Confirmed as True Threat</b> by admin <code>{caller_id}</code>.",
+                    )
+            elif kind == "fp" and len(parts) >= 4:
+                actor_id = int(parts[3])
+                await self._heal_false_positive(inc_id, target_chat, actor_id, caller_id)
+                await self.client.answer_callback_query(cb_id, "↩️ False Positive healed! User unbanned & trust restored.")
+                if cb_chat_id and cb_msg_id:
+                    await self.client.edit_message_text(
+                        cb_chat_id,
+                        cb_msg_id,
+                        f"↩️ <b>Incident <code>#{inc_id}</code> Marked False Positive</b>\n"
+                        f"• User <code>{actor_id}</code> unbanned &amp; trust score boosted\n"
+                        f"• Federation ban removed (if applied)\n"
+                        f"• Precision telemetry updated by admin <code>{caller_id}</code>",
+                    )
+            elif kind == "fb" and len(parts) >= 4:
+                actor_id = int(parts[3])
+                cfg = self.storage.get_chat_config(target_chat)
+                self.storage.add_federation_ban(
+                    entity_id=actor_id,
+                    reason=f"Admin escalated incident #{inc_id}",
+                    category="REPUTATION_FEDBAN",
+                    source_chat_id=target_chat,
+                    federation_id=cfg.federation_id,
+                )
+                self.storage.record_incident_feedback(inc_id, target_chat, "CONFIRMED", caller_id, notes="fedban")
+                await self.client.answer_callback_query(cb_id, "🌐 Entity Federation-Banned across network!")
+                if cb_chat_id and cb_msg_id:
+                    await self.client.edit_message_text(
+                        cb_chat_id,
+                        cb_msg_id,
+                        f"🌐 <b>Incident <code>#{inc_id}</code> Escalated to Federation Ban</b>\n"
+                        f"Actor <code>{actor_id}</code> is now blocked across all linked groups &amp; channels.",
+                    )
+            return
+
         await self.client.answer_callback_query(cb_id)
 
+    async def _heal_false_positive(
+        self, incident_id: str, chat_id: int, actor_id: int, reviewer_id: int
+    ) -> None:
+        """Self-healing loop: undo ban/mute/FedBan, boost user trust & record FP precision metric."""
+        cfg = self.storage.get_chat_config(chat_id)
+        self.storage.record_incident_feedback(incident_id, chat_id, "FALSE_POSITIVE", reviewer_id)
+        if actor_id:
+            self.storage.remove_federation_ban(actor_id, cfg.federation_id)
+            self.storage.heal_user_after_false_positive(chat_id, actor_id)
+            try:
+                await self.client.unban_chat_member(chat_id, actor_id, only_if_banned=True)
+            except TelegramAPIError:
+                pass
+            try:
+                await self.client.restrict_chat_member(chat_id, actor_id, RESTORED_USER_PERMISSIONS)
+            except TelegramAPIError:
+                pass
+        self.metrics.false_positives_healed += 1
+
+    async def _render_panel_in_place(
+        self, container_chat_id: int, message_id: int | None, target_chat_id: int, tab: str = "overview"
+    ) -> None:
+        cfg = self.storage.get_chat_config(target_chat_id)
+        raid = self.engine.behavioral.get_raid_state(target_chat_id, time.time())
+        stats = self.storage.get_chat_stats(target_chat_id, window_seconds=86400)
+        prec = self.storage.get_precision_metrics(target_chat_id)
+        recent = self.storage.get_incidents(target_chat_id, limit=8) if tab == "threats" else None
+        text, markup = render_control_panel(cfg, raid, stats, prec, self.signer, tab=tab, recent_incidents=recent)
+        if message_id:
+            try:
+                await self.client.edit_message_text(container_chat_id, message_id, text, reply_markup=markup)
+                return
+            except TelegramAPIError:
+                pass
+        await self.client.send_message(container_chat_id, text, reply_markup=markup)
+
+    # ------------------------------------------------------------------
+    # Membership & Admin Change Watchdog
+    # ------------------------------------------------------------------
     async def _handle_chat_member(self, update: dict[str, Any]) -> None:
         chat = update.get("chat") or {}
         chat_id = int(chat["id"])
@@ -459,21 +896,19 @@ class AegisTGBot:
         actor = update.get("from") or {}
         now = float(update.get("date") or time.time())
 
-        # Invalidate admin cache whenever roles change
         if old_status != new_status and (
             old_status in {"administrator", "creator"} or new_status in {"administrator", "creator"}
         ):
             self._admin_cache.pop(chat_id, None)
             await self._notify_alert_chat(
                 chat_id,
-                f"<b>ADMIN ROLE CHANGE DETECTED</b>\n"
-                f"Chat: <b>{html.escape(chat.get('title', str(chat_id)))}</b>\n"
-                f"Target: <code>{target_user.get('id')}</code> (@{target_user.get('username') or 'no_user'})\n"
-                f"Change: <code>{old_status}</code> -> <code>{new_status}</code>\n"
-                f"Actor: <code>{actor.get('id')}</code> (@{actor.get('username') or 'no_user'})",
+                f"⚠️ <b>ADMIN ROLE CHANGE DETECTED</b>\n"
+                f"• Chat: <b>{html.escape(chat.get('title', str(chat_id)))}</b>\n"
+                f"• Target: <code>{target_user.get('id')}</code> (@{target_user.get('username') or 'no_user'})\n"
+                f"• Change: <code>{old_status}</code> → <code>{new_status}</code>\n"
+                f"• Actor: <code>{actor.get('id')}</code> (@{actor.get('username') or 'no_user'})",
             )
 
-        # Member Joined -> Feed Raid State Machine & Pre-Check Federation Ban!
         if old_status in {"left", "kicked"} and new_status in {"member", "restricted"}:
             uid = int(target_user["id"])
             cfg = self.storage.get_chat_config(chat_id)
@@ -484,7 +919,6 @@ class AegisTGBot:
                     pass
                 return
 
-            # Initialize fresh join timestamp for New-Member Sandbox
             self.storage.get_user_reputation(
                 chat_id, uid, default_trust=self.config.reputation.initial_trust_score, now=now
             )
@@ -518,34 +952,32 @@ class AegisTGBot:
         args = text.split()[1:]
 
         if cmd_token in {"/start", "/help"}:
+            card_text, card_markup = render_welcome_card(self.bot_username, self.signer)
+            sent = await self.client.send_message(chat_id, card_text, reply_markup=card_markup)
+            if chat_type != ChatType.PRIVATE and isinstance(sent, dict) and sent.get("message_id"):
+                self.client.schedule_auto_delete(chat_id, int(sent["message_id"]), delay_seconds=30.0)
+            return True
+
+        if cmd_token == "/connect" and chat_type == ChatType.PRIVATE:
             await self.client.send_message(
                 chat_id,
-                "<b>AegisTG — Intelligent Telegram Group & Channel Protector</b>\n\n"
-                "Protects groups, linked discussion groups, and channels against bans, raids, "
-                "edit-bait sabotage, phishing, malware, and admin compromise.\n\n"
-                "<b>Key Commands:</b>\n"
-                "• <code>/audit</code> — 0-100 Group/Channel Security Posture Score\n"
-                "• <code>/draft &lt;text&gt;</code> — Pre-publish Channel Compliance Scan\n"
-                "• <code>/status</code> — Live Raid State & 24h Threat Telemetry\n"
-                "• <code>/lockdown</code> / <code>/unlock</code> — Emergency Anti-Raid Mode\n"
-                "• <code>/strict_channel on|off</code> — Auto-quarantine hijacked channel posts\n"
-                "• <code>/allow_domain &lt;domain&gt;</code> — Whitelist trusted domain\n"
-                "• <code>/ban_media</code> — Reply to scam image to ban its perceptual dHash\n"
-                "• <code>/set_alert_chat</code> — Route owner alerts here\n"
-                "• <code>/export_audit</code> — Export compliance proof for abuse@telegram.org\n"
-                "• <code>/privacy</code> — Bot Privacy Policy",
+                "🔗 <b>One-Tap Chat &amp; Channel Binding</b>\n"
+                "Choose a Group, Channel, or Owner Alert Chat directly from Telegram's native picker:",
+                reply_markup=render_native_chat_picker_keyboard(),
             )
             return True
 
         if cmd_token == "/privacy":
-            await self.client.send_message(
+            sent = await self.client.send_message(
                 chat_id,
-                f"<b>AegisTG Privacy Policy</b>\n"
-                f"• Message text is inspected transiently in memory only.\n"
-                f"• Zero data scraping or AI/ML training (strict Telegram ToS compliance).\n"
+                f"🔒 <b>AegisTG Privacy Policy</b>\n"
+                f"• Message text is inspected transiently in RAM only.\n"
+                f"• Zero data scraping or AI/ML model training (strict Telegram ToS compliance).\n"
                 f"• Edit-bait hashes auto-expire in {self.config.edit_bait.snapshot_ttl_days} days.\n"
                 f"• Full Policy: {html.escape(self.config.privacy_policy_url)}",
             )
+            if chat_type != ChatType.PRIVATE and isinstance(sent, dict) and sent.get("message_id"):
+                self.client.schedule_auto_delete(chat_id, int(sent["message_id"]), delay_seconds=25.0)
             return True
 
         if cmd_token in {"/draft", "/check"}:
@@ -566,47 +998,79 @@ class AegisTGBot:
             if user_id is None or not await self._is_user_admin(chat_id, int(user_id)):
                 return False
 
+        if cmd_token == "/panel":
+            target_id = chat_id
+            if chat_type == ChatType.PRIVATE:
+                registered = self.storage.list_chat_configs(enabled_only=True)
+                if not registered:
+                    await self.client.send_message(
+                        chat_id,
+                        "No groups or channels bound yet! Use /connect or add AegisTG as Admin first.",
+                    )
+                    return True
+                target_id = registered[0].chat_id
+            await self._render_panel_in_place(chat_id, None, target_id, tab="overview")
+            return True
+
+        if cmd_token == "/digest":
+            cfg = self.storage.get_chat_config(chat_id)
+            stats_7d = self.storage.get_chat_stats(chat_id, window_seconds=7 * 86400)
+            prec = self.storage.get_precision_metrics(chat_id)
+            d_text, d_markup = render_digest_card(cfg, stats_7d, prec, self.signer)
+            await self.client.send_message(chat_id, d_text, reply_markup=d_markup)
+            return True
+
         if cmd_token == "/status":
             cfg = self.storage.get_chat_config(chat_id)
             stats = self.storage.get_chat_stats(chat_id, window_seconds=86400)
+            prec = self.storage.get_precision_metrics(chat_id)
             raid = self.engine.behavioral.get_raid_state(chat_id, time.time())
-            cats = ", ".join(f"{k}:{v}" for k, v in stats["by_category"].items()) or "None"
-            await self.client.send_message(
-                chat_id,
-                f"<b>AegisTG Live Status</b>\n"
-                f"• Protection: <code>{'ENABLED' if cfg.enabled else 'DISABLED'}</code>\n"
-                f"• Raid State: <code>{raid.value}</code>\n"
-                f"• Strict Channel Guard: <code>{cfg.strict_channel_guard}</code>\n"
-                f"• 24h Blocked Incidents: <b>{stats['total_incidents']}</b>\n"
-                f"• Categories: <code>{html.escape(cats)}</code>\n"
-                f"• Avg Detection Latency: <code>{stats['avg_latency_ms']} ms</code>",
-            )
+            text_out, markup = render_control_panel(cfg, raid, stats, prec, self.signer, tab="overview")
+            await self.client.send_message(chat_id, text_out, reply_markup=markup)
             return True
 
         if cmd_token == "/audit":
+            try:
+                await self.client.send_chat_action(chat_id, "typing")
+            except TelegramAPIError:
+                pass
             try:
                 info = await self.client.get_chat(chat_id)
                 admins = await self.client.get_chat_administrators(chat_id)
                 cfg = self.storage.get_chat_config(chat_id)
                 report = self.auditor.audit_chat_metadata(info, admins, self.bot_user_id, cfg)
-                await self.client.send_message(chat_id, self.auditor.format_audit_report(report))
+                a_text, a_markup = render_audit_card(report, self.signer)
+                effect = (
+                    EFFECT_CELEBRATION
+                    if chat_type == ChatType.PRIVATE and report.score >= 95
+                    else None
+                )
+                await self.client.send_message(
+                    chat_id, a_text, reply_markup=a_markup, message_effect_id=effect
+                )
             except TelegramAPIError as exc:
                 await self.client.send_message(chat_id, f"Audit failed: {html.escape(str(exc))}")
             return True
 
         if cmd_token == "/lockdown":
             await self._activate_lockdown(chat_id, reason="Manual admin /lockdown command")
-            await self.client.send_message(chat_id, "Emergency Lockdown ACTIVATED. Group is now read-only.")
+            sent = await self.client.send_message(
+                chat_id, "🚨 <b>Emergency Lockdown ACTIVATED.</b> Group is now read-only."
+            )
+            if chat_type != ChatType.PRIVATE and isinstance(sent, dict) and sent.get("message_id"):
+                self.client.schedule_auto_delete(chat_id, int(sent["message_id"]), delay_seconds=20.0)
             return True
 
         if cmd_token == "/unlock":
             ok = await self._lift_lockdown(chat_id)
-            await self.client.send_message(
+            sent = await self.client.send_message(
                 chat_id,
-                "Lockdown lifted and original permissions restored."
+                "🔓 <b>Lockdown lifted</b> and exact pre-lockdown permissions restored."
                 if ok
                 else "Could not restore permissions — verify bot has Restrict Members permission.",
             )
+            if chat_type != ChatType.PRIVATE and isinstance(sent, dict) and sent.get("message_id"):
+                self.client.schedule_auto_delete(chat_id, int(sent["message_id"]), delay_seconds=20.0)
             return True
 
         if cmd_token == "/strict_channel" and args:
@@ -614,7 +1078,7 @@ class AegisTGBot:
             cfg.strict_channel_guard = args[0].lower() in {"on", "true", "1", "yes"}
             self.storage.upsert_chat_config(cfg)
             await self.client.send_message(
-                chat_id, f"Strict Channel Auto-Quarantine set to <code>{cfg.strict_channel_guard}</code>."
+                chat_id, f"🛡 Strict Channel Auto-Quarantine set to <code>{cfg.strict_channel_guard}</code>."
             )
             return True
 
@@ -624,7 +1088,7 @@ class AegisTGBot:
             if domain not in cfg.allowlist_domains:
                 cfg.allowlist_domains.append(domain)
                 self.storage.upsert_chat_config(cfg)
-            await self.client.send_message(chat_id, f"Domain <code>{html.escape(domain)}</code> whitelisted.")
+            await self.client.send_message(chat_id, f"✅ Domain <code>{html.escape(domain)}</code> whitelisted.")
             return True
 
         if cmd_token == "/set_alert_chat":
@@ -633,7 +1097,7 @@ class AegisTGBot:
             cfg.alert_chat_id = target_id
             self.storage.upsert_chat_config(cfg)
             await self.client.send_message(
-                chat_id, f"Owner Security Alert Chat set to <code>{target_id}</code>."
+                chat_id, f"📡 Owner Security Alert Chat set to <code>{target_id}</code>."
             )
             return True
 
@@ -649,7 +1113,7 @@ class AegisTGBot:
                 federation_id=cfg.federation_id,
             )
             await self.client.send_message(
-                chat_id, f"Entity <code>{target_uid}</code> added to Federation Ban List."
+                chat_id, f"🌐 Entity <code>{target_uid}</code> added to Federation Ban List."
             )
             return True
 
@@ -659,7 +1123,7 @@ class AegisTGBot:
             removed = self.storage.remove_federation_ban(target_uid, cfg.federation_id)
             await self.client.send_message(
                 chat_id,
-                f"Entity <code>{target_uid}</code> removed from Federation Ban List."
+                f"✅ Entity <code>{target_uid}</code> removed from Federation Ban List."
                 if removed
                 else f"Entity <code>{target_uid}</code> was not Federation-banned.",
             )
@@ -668,13 +1132,23 @@ class AegisTGBot:
         if cmd_token == "/ban_media" and msg.get("reply_to_message"):
             media = await self._parse_media(msg["reply_to_message"])
             if media and media.raw_bytes:
-                dhash = compute_dhash(media.raw_bytes)
+                try:
+                    dhash = compute_dhash(media.raw_bytes)
+                except DecompressionBombDetected:
+                    dhash = None
                 if dhash is not None:
                     reason = " ".join(args) or "Admin-banned scam/raid visual flyer"
-                    self.storage.add_banned_media_hash(dhash, "SCAM_PHISHING_SAFEGUARD", reason)
+                    self.engine.media_analyzer.index_banned_hash(
+                        dhash, "SCAM_PHISHING_SAFEGUARD", reason
+                    )
                     await self.client.send_message(
                         chat_id,
-                        f"Perceptual dHash <code>{dhash:016x}</code> permanently banned across all protected chats.",
+                        f"🖼 Perceptual dHash <code>{dhash:016x}</code> permanently banned &amp; indexed in O(log N) BK-Tree!",
+                        reply_markup={
+                            "inline_keyboard": [
+                                [{"text": "📋 Copy dHash", "copy_text": {"text": f"{dhash:016x}"}}]
+                            ]
+                        },
                     )
                     return True
             await self.client.send_message(chat_id, "Reply to a photo/image message to ban its perceptual hash.")
@@ -684,13 +1158,26 @@ class AegisTGBot:
             pack_json = self.auditor.format_appeal_json(chat_id, days=30)
             await self.client.send_message(
                 chat_id,
-                f"<b>Appeal Forensics Pack (30d)</b>\n<pre>{html.escape(pack_json[:3600])}</pre>",
+                f"📄 <b>Appeal Forensics Pack (30d)</b>\n"
+                f"<blockquote expandable><pre>{html.escape(pack_json[:3400])}</pre></blockquote>",
+                reply_markup={
+                    "inline_keyboard": [
+                        [
+                            {
+                                "text": "📋 Copy Appeal Email",
+                                "copy_text": {"text": "abuse@telegram.org"},
+                            }
+                        ]
+                    ]
+                },
             )
             return True
 
         if cmd_token == "/purge_chat_data":
             self.storage.purge_chat_data(chat_id)
-            await self.client.send_message(chat_id, "All stored AegisTG security metadata for this chat has been erased.")
+            await self.client.send_message(
+                chat_id, "🧹 All stored AegisTG security metadata for this chat has been permanently erased."
+            )
             return True
 
         return False
@@ -708,26 +1195,30 @@ class AegisTGBot:
             is_admin=True,
         )
         res = await self.engine.evaluate(ev)
-        badge = (
-            "SAFE TO PUBLISH"
-            if res.action == VerdictAction.ALLOW
-            else ("REVIEW WARNING" if res.action == VerdictAction.WARN_MONITOR else "HIGH BAN RISK — DO NOT PUBLISH")
-        )
-        details = "\n".join(f"• [{s.score}] {html.escape(s.reason)}" for s in res.signals) or "• No Telegram ToS risk signals detected."
+
+        # Native emoji reaction feedback on the user's draft message!
+        if reply_to:
+            rx = "👍" if res.action == VerdictAction.ALLOW else ("👀" if res.action == VerdictAction.WARN_MONITOR else "⚡")
+            try:
+                await self.client.set_message_reaction(chat_id, reply_to, rx)
+            except TelegramAPIError:
+                pass
+
+        card_text, card_markup = render_draft_card(res, draft_preview=draft_text)
         await self.client.send_message(
             chat_id=chat_id,
             reply_to_message_id=reply_to,
-            text=(
-                f"<b>Pre-Publish Channel Compliance Scan</b>\n"
-                f"Verdict: <b>{badge}</b>\n"
-                f"Risk Score: <code>{res.risk_score}/100</code> ({res.latency_ms} ms)\n\n"
-                f"{details}"
-            ),
+            text=card_text,
+            reply_markup=card_markup,
         )
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Authorization & Parsing Helpers
     # ------------------------------------------------------------------
+    async def _can_manage_chat(self, target_chat_id: int, user_id: int) -> bool:
+        """Server-side admin check (never trust client-side UI visibility alone!)."""
+        return await self._is_user_admin(target_chat_id, user_id)
+
     async def _is_user_admin(self, chat_id: int, user_id: int) -> bool:
         now = time.monotonic()
         cached = self._admin_cache.get(chat_id)
@@ -742,18 +1233,16 @@ class AegisTGBot:
             return False
 
     def _parse_entities(self, raw_entities: list[dict[str, Any]]) -> list[EntityInfo]:
-        out: list[EntityInfo] = []
-        for e in raw_entities:
-            out.append(
-                EntityInfo(
-                    type=str(e.get("type", "")),
-                    offset=int(e.get("offset", 0)),
-                    length=int(e.get("length", 0)),
-                    url=e.get("url"),
-                    user_id=(e.get("user") or {}).get("id"),
-                )
+        return [
+            EntityInfo(
+                type=str(e.get("type", "")),
+                offset=int(e.get("offset", 0)),
+                length=int(e.get("length", 0)),
+                url=e.get("url"),
+                user_id=(e.get("user") or {}).get("id"),
             )
-        return out
+            for e in raw_entities
+        ]
 
     async def _parse_media(self, msg: dict[str, Any]) -> MediaInfo | None:
         media: MediaInfo | None = None
@@ -768,7 +1257,6 @@ class AegisTGBot:
                 file_size=doc.get("file_size"),
             )
         elif msg.get("photo"):
-            # Pick medium thumbnail (fast to download & ideal for 8x8 dHash!)
             photos = msg["photo"]
             chosen = photos[min(1, len(photos) - 1)]
             media = MediaInfo(
@@ -805,25 +1293,21 @@ class AegisTGBot:
         return media
 
     async def _send_owner_alert(self, event: TelegramEvent, result: EvaluationResult) -> None:
-        cat = result.primary_category.value if result.primary_category else "POLICY_RISK"
-        actor = event.sender_chat_id if result.ban_sender_chat else event.user_id
-        text = (
-            f"<b>AegisTG Security Alert</b>\n"
-            f"• Chat: <code>{event.chat_id}</code> ({event.chat_type.value})\n"
-            f"• Event: <code>{event.event_type.value}</code>\n"
-            f"• Category: <b>{cat}</b> | Risk: <b>{result.risk_score}/100</b>\n"
-            f"• Action: <code>{result.action.value}</code>\n"
-            f"• Actor ID: <code>{actor}</code>\n"
-            f"• Summary: {html.escape(result.summary[:300])}"
-        )
-        await self._notify_alert_chat(event.chat_id, text)
+        inc_id = result.incident_id or "adhoc"
+        card_text, card_markup = render_owner_alert_card(event, result, inc_id, self.signer)
+        await self._notify_alert_chat(event.chat_id, card_text, reply_markup=card_markup)
 
-    async def _notify_alert_chat(self, source_chat_id: int, html_text: str) -> None:
+    async def _notify_alert_chat(
+        self,
+        source_chat_id: int,
+        html_text: str,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> None:
         cfg = self.storage.get_chat_config(source_chat_id)
         target = cfg.alert_chat_id or self.config.owner_alert_chat_id
         if target is None:
             return
         try:
-            await self.client.send_message(target, html_text)
+            await self.client.send_message(target, html_text, reply_markup=reply_markup)
         except TelegramAPIError as exc:
             logger.warning("Failed sending owner alert to %s: %s", target, exc)

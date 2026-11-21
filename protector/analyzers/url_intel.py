@@ -1,4 +1,4 @@
-"""URL, Telegram Entity & Phishing Intelligence Analyzer."""
+"""URL, Telegram Entity, Public Suffix List (PSL) & IDNA Homograph Intelligence Analyzer."""
 
 from __future__ import annotations
 
@@ -7,9 +7,12 @@ import math
 import re
 from urllib.parse import urlparse
 
+import idna
+import publicsuffix2
+
 from protector.config import UrlsConfig
 from protector.models import ChatConfig, RiskSignal, TelegramEvent, ThreatCategory
-from protector.normalizer import NormalizedText
+from protector.normalizer import HOMOGLYPH_MAP, LEET_MAP, NormalizedText
 
 _RE_URL = re.compile(
     r"(?:https?://|www\.)[^\s<>\"'\]\)]+|"
@@ -65,13 +68,37 @@ def _shannon_entropy(value: str) -> float:
     return -sum((count / length) * math.log2(count / length) for count in freq.values())
 
 
+def _registrable_domain(host: str) -> str:
+    """Extract true eTLD+1 via Public Suffix List (e.g., evil.telegram.org.co.uk -> org.co.uk)."""
+    host = host.lower().strip(".")
+    try:
+        sld = publicsuffix2.get_sld(host, strict=False)
+        return (sld or host).lower()
+    except Exception:
+        return host
+
+
 def _domain_matches(host: str, candidate_domains: set[str]) -> bool:
     host = host.lower().strip(".")
+    sld = _registrable_domain(host)
     for d in candidate_domains:
         d = d.lower().strip(".")
-        if host == d or host.endswith("." + d):
-            return True
+        if host == d or host.endswith("." + d) or sld == d:
+            # Guard against subdomain spoofing like telegram.org.evil.com!
+            if host == d or host.endswith("." + d):
+                return True
     return False
+
+
+def _decode_idna_safe(host: str) -> tuple[str, bool]:
+    """Decode punycode (xn--) back to Unicode to expose hidden homoglyph brand spoofing."""
+    if "xn--" not in host:
+        return host, False
+    try:
+        decoded = idna.decode(host)
+        return decoded.lower(), True
+    except Exception:
+        return host, True
 
 
 def _is_ip_host(host: str) -> bool:
@@ -120,7 +147,7 @@ def extract_urls(event: TelegramEvent, norm: NormalizedText) -> list[tuple[str, 
 
 
 class UrlIntelAnalyzer:
-    """Evaluates URLs and Telegram entities for phishing, typosquatting, and invite hijacking."""
+    """Evaluates URLs & entities using Public Suffix List, IDNA decoding, and brand-spoof detection."""
 
     def __init__(self, config: UrlsConfig) -> None:
         self.config = config
@@ -195,32 +222,34 @@ class UrlIntelAnalyzer:
                     )
                 continue
 
-            # 3. Allowlisted Safe Domains
+            # 3. Allowlisted Safe Domains (PSL-verified so telegram.org.evil.co.uk is NOT allowlisted!)
             if _domain_matches(host, chat_allowlist):
                 continue
 
             untrusted_count += 1
-
             url_risk = 0
             reasons: list[str] = []
 
-            # 4. IDN / Punycode Homograph Attack
-            if "xn--" in host:
+            # 4. IDN / Punycode Homograph Attack (decodes xn-- back to Unicode!)
+            decoded_host, is_punycode = _decode_idna_safe(host)
+            if is_punycode:
                 url_risk += 50
-                reasons.append("IDN/punycode homograph domain")
+                reasons.append(f"IDN/punycode homograph domain ({decoded_host})")
 
             # 5. Raw IP-literal URL
             if _is_ip_host(host):
                 url_risk += 48
                 reasons.append("raw IP address URL")
 
-            # 6. Protected Brand Typosquatting / Impersonation
-            host_alnum = re.sub(r"[^a-z0-9]", "", host)
+            # 6. Protected Brand Typosquatting / Impersonation (homoglyph + leetspeak folded!)
+            folded_host = decoded_host.translate(HOMOGLYPH_MAP).translate(LEET_MAP)
+            host_alnum = re.sub(r"[^a-z0-9]", "", folded_host)
+            sld = _registrable_domain(host)
             for brand in self._brands:
                 official = OFFICIAL_BRAND_DOMAINS.get(brand, set())
                 if brand in host_alnum and not _domain_matches(host, official):
                     url_risk += 68
-                    reasons.append(f"brand impersonation/typosquatting ({brand})")
+                    reasons.append(f"brand impersonation/typosquatting ({brand} on {sld})")
                     break
 
             # 7. URL Shortener (often hides phishing/malware redirects)
@@ -268,7 +297,12 @@ class UrlIntelAnalyzer:
                         score=capped,
                         reason=f"Suspicious URL '{host}': {', '.join(reasons)}",
                         hard_block=capped >= 90,
-                        evidence={"host": host, "reasons": reasons, "hidden_link": is_hidden_text_link},
+                        evidence={
+                            "host": host,
+                            "registrable_domain": sld,
+                            "reasons": reasons,
+                            "hidden_link": is_hidden_text_link,
+                        },
                     )
                 )
 
