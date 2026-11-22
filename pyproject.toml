@@ -7,6 +7,9 @@ name = "aegistg-protector"
 version = "2.0.0"
 description = "Intelligent 9-Layer Telegram Group & Channel Protection System with Native Bot API UX"
 readme = "README.md"
+authors = [
+    { name = "drkingbd" },
+]
 requires-python = ">=3.11"
 dependencies = [
     "PyYAML>=6.0",
@@ -15,6 +18,10 @@ dependencies = [
     "publicsuffix2>=2.20191221",
     "idna>=3.6",
 ]
+
+[project.urls]
+Homepage = "https://drkingbd.cc"
+Telegram = "https://t.me/drkingbd"
 
 [project.scripts]
 aegistg = "protector.__main__:main"

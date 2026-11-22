@@ -632,6 +632,61 @@ class TestNativeUXAndBotEndToEnd(unittest.IsolatedAsyncioTestCase):
             any(f.check_id == "linked_group_parity" and f.severity == "CRITICAL" for f in report.findings)
         )
 
+    async def test_developer_info_profile_and_commands(self) -> None:
+        desc_calls = [p for m, p in self.mock_client.calls if m == "setMyDescription"]
+        short_calls = [p for m, p in self.mock_client.calls if m == "setMyShortDescription"]
+        self.assertTrue(desc_calls)
+        self.assertIn("https://t.me/drkingbd", desc_calls[0]["description"])
+        self.assertIn("https://drkingbd.cc", desc_calls[0]["description"])
+        self.assertTrue(short_calls)
+        self.assertLessEqual(len(short_calls[0]["short_description"]), 120)
+        self.assertIn("drkingbd.cc", short_calls[0]["short_description"])
+
+        for cmd in ("/start", "/about", "/dev"):
+            self.mock_client.calls.clear()
+            await self.bot.handle_update(
+                {
+                    "update_id": 50,
+                    "message": {
+                        "message_id": 100,
+                        "date": int(time.time()),
+                        "chat": {"id": 555, "type": "private"},
+                        "from": {"id": 555, "is_bot": False},
+                        "text": cmd,
+                    },
+                }
+            )
+            sends = [p for m, p in self.mock_client.calls if m == "sendMessage"]
+            self.assertEqual(len(sends), 1, f"Expected sendMessage for {cmd}")
+            self.assertIn("https://t.me/drkingbd", sends[0]["text"])
+            self.assertIn("https://drkingbd.cc", sends[0]["text"])
+            urls = [
+                b.get("url")
+                for row in sends[0]["reply_markup"]["inline_keyboard"]
+                for b in row
+                if b.get("url")
+            ]
+            self.assertIn("https://t.me/drkingbd", urls)
+            self.assertIn("https://drkingbd.cc", urls)
+
+        self.mock_client.calls.clear()
+        await self.bot.handle_update(
+            {
+                "update_id": 51,
+                "message": {
+                    "message_id": 101,
+                    "date": int(time.time()),
+                    "chat": {"id": 555, "type": "private"},
+                    "from": {"id": 555, "is_bot": False},
+                    "text": "/privacy",
+                },
+            }
+        )
+        priv_sends = [p for m, p in self.mock_client.calls if m == "sendMessage"]
+        self.assertEqual(len(priv_sends), 1)
+        self.assertIn("https://t.me/drkingbd", priv_sends[0]["text"])
+        self.assertIn("https://drkingbd.cc", priv_sends[0]["text"])
+
 
 if __name__ == "__main__":
     unittest.main()

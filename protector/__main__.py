@@ -8,6 +8,12 @@ import logging
 import sys
 import time
 
+from protector import (
+    __app_name__,
+    __developer_telegram__,
+    __developer_website__,
+    __version__,
+)
 from protector.bot import AegisTGBot
 from protector.config import load_config
 from protector.engine import ProtectionEngine
@@ -51,6 +57,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         prog="protector",
         description="AegisTG — Intelligent Telegram Group & Channel Protection System",
+        epilog=f"Developer: {__developer_telegram__} | {__developer_website__}",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"{__app_name__} v{__version__} ({__developer_telegram__} | {__developer_website__})",
     )
     parser.add_argument("--policy", default=None, help="Path to custom YAML policy file")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")

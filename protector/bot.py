@@ -9,6 +9,11 @@ import logging
 import time
 from typing import Any
 
+from protector import (
+    __developer__,
+    __developer_telegram__,
+    __developer_website__,
+)
 from protector.analyzers.media_guard import DecompressionBombDetected, compute_dhash
 from protector.auditor import SecurityAuditor
 from protector.config import BotConfig
@@ -32,6 +37,7 @@ from protector.ui import (
     build_emoji_captcha,
     render_audit_card,
     render_control_panel,
+    render_dev_info_card,
     render_digest_card,
     render_draft_card,
     render_inline_scan_result,
@@ -171,12 +177,13 @@ class AegisTGBot:
         # 2. Polish native Telegram bot profile description
         try:
             await self.client.set_my_short_description(
-                "🛡 9-Layer Telegram Group & Channel Protector — Anti-Raid, Edit-Bait, Scam, Malware & Audit Shield."
+                "🛡 9-Layer Telegram Group & Channel Protector — Anti-Raid, Scam & Malware Shield | @drkingbd (drkingbd.cc)"
             )
             await self.client.set_my_description(
                 "AegisTG protects Telegram Groups, Linked Discussion Groups, and Broadcast Channels from bans, "
                 "raids, delayed edit-bait sabotage, phishing, malware, and admin hijacks — with zero clutter "
-                "and strict Telegram Terms of Service & Privacy compliance."
+                "and strict Telegram Terms of Service & Privacy compliance.\n\n"
+                f"Developer: {__developer_telegram__} | {__developer_website__}"
             )
         except TelegramAPIError as exc:
             logger.debug("Optional setMyDescription skipped: %s", exc)
@@ -188,9 +195,11 @@ class AegisTGBot:
             {"command": "connect", "description": "🔗 Native Group/Channel & Alert Chat Picker"},
             {"command": "draft", "description": "🧪 Pre-publish Channel Compliance Scan"},
             {"command": "privacy", "description": "🔒 Bot Privacy Policy (ToS Sec 4)"},
+            {"command": "about", "description": "👨‍💻 About AegisTG & Developer Info"},
         ]
         member_group_commands = [
             {"command": "privacy", "description": "🔒 View Bot Privacy Policy"},
+            {"command": "about", "description": "👨‍💻 About AegisTG & Developer Info"},
             {"command": "help", "description": "ℹ️ About AegisTG Protection"},
         ]
         admin_group_commands = [
@@ -713,7 +722,9 @@ class AegisTGBot:
                     f"• Transient in-memory content inspection only.\n"
                     f"• Zero data scraping or AI/ML model training.\n"
                     f"• Edit-bait hashes auto-expire after {self.config.edit_bait.snapshot_ttl_days} days.\n"
-                    f"• Full Policy: {html.escape(self.config.privacy_policy_url)}",
+                    f"• Full Policy: {html.escape(self.config.privacy_policy_url)}\n"
+                    f"• Developer: <a href=\"{__developer_telegram__}\">{__developer__}</a> • "
+                    f"<a href=\"{__developer_website__}\">drkingbd.cc</a>",
                 )
             elif payload == "chats":
                 chats = self.storage.list_chat_configs(enabled_only=True)
@@ -958,6 +969,13 @@ class AegisTGBot:
                 self.client.schedule_auto_delete(chat_id, int(sent["message_id"]), delay_seconds=30.0)
             return True
 
+        if cmd_token in {"/about", "/dev"}:
+            dev_text, dev_markup = render_dev_info_card()
+            sent = await self.client.send_message(chat_id, dev_text, reply_markup=dev_markup)
+            if chat_type != ChatType.PRIVATE and isinstance(sent, dict) and sent.get("message_id"):
+                self.client.schedule_auto_delete(chat_id, int(sent["message_id"]), delay_seconds=30.0)
+            return True
+
         if cmd_token == "/connect" and chat_type == ChatType.PRIVATE:
             await self.client.send_message(
                 chat_id,
@@ -974,7 +992,9 @@ class AegisTGBot:
                 f"• Message text is inspected transiently in RAM only.\n"
                 f"• Zero data scraping or AI/ML model training (strict Telegram ToS compliance).\n"
                 f"• Edit-bait hashes auto-expire in {self.config.edit_bait.snapshot_ttl_days} days.\n"
-                f"• Full Policy: {html.escape(self.config.privacy_policy_url)}",
+                f"• Full Policy: {html.escape(self.config.privacy_policy_url)}\n"
+                f"• Developer: <a href=\"{__developer_telegram__}\">{__developer__}</a> • "
+                f"<a href=\"{__developer_website__}\">drkingbd.cc</a>",
             )
             if chat_type != ChatType.PRIVATE and isinstance(sent, dict) and sent.get("message_id"):
                 self.client.schedule_auto_delete(chat_id, int(sent["message_id"]), delay_seconds=25.0)

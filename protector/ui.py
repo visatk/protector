@@ -16,6 +16,13 @@ import html
 import secrets
 from typing import Any
 
+from protector import (
+    __app_name__,
+    __developer__,
+    __developer_telegram__,
+    __developer_website__,
+    __version__,
+)
 from protector.models import AuditReport, ChatConfig, EvaluationResult, IncidentRecord, RaidState, TelegramEvent, VerdictAction
 from protector.security import CallbackSigner
 
@@ -126,7 +133,9 @@ def render_welcome_card(bot_username: str, signer: CallbackSigner) -> tuple[str,
         "• <b>Channel Pre-Publish &amp; Hijack Guard:</b> /draft checks + instant auto-quarantine\n"
         "• <b>Self-Healing Precision:</b> 1-tap False Positive undo &amp; learning loop"
         "</blockquote>\n\n"
-        "👇 <b>Quick Start:</b> Add AegisTG as Admin (rights pre-filled), or paste any draft post right here to test it before publishing!"
+        "👇 <b>Quick Start:</b> Add AegisTG as Admin (rights pre-filled), or paste any draft post right here to test it before publishing!\n\n"
+        f"👨‍💻 <b>Developer:</b> <a href=\"{__developer_telegram__}\">{__developer__}</a> • "
+        f"<a href=\"{__developer_website__}\">drkingbd.cc</a>"
     )
     markup = {
         "inline_keyboard": [
@@ -157,6 +166,30 @@ def render_welcome_card(bot_username: str, signer: CallbackSigner) -> tuple[str,
                 btn("🔗 Native Chat Picker", callback_data=signer.sign("home", "picker")),
                 btn("🔒 Privacy Policy", callback_data=signer.sign("home", "privacy")),
             ],
+            [
+                btn("👨‍💻 Developer", url=__developer_telegram__),
+                btn("🌐 Website", url=__developer_website__),
+            ],
+        ]
+    }
+    return text, markup
+
+
+def render_dev_info_card() -> tuple[str, dict[str, Any]]:
+    """Render the Developer & About card for `/about` and `/dev`."""
+    text = (
+        f"🛡 <b>{__app_name__}</b> <code>v{__version__}</code>\n"
+        "<i>9-Layer Intelligent Telegram Group &amp; Channel Protection System</i>\n\n"
+        "👨‍💻 <b>Developer Info</b>\n"
+        f"• Telegram: <a href=\"{__developer_telegram__}\">{__developer__}</a>\n"
+        f"• Website: <a href=\"{__developer_website__}\">{__developer_website__}</a>"
+    )
+    markup = {
+        "inline_keyboard": [
+            [
+                btn("💬 Telegram", url=__developer_telegram__, style="primary"),
+                btn("🌐 Website", url=__developer_website__, style="success"),
+            ]
         ]
     }
     return text, markup

@@ -62,3 +62,11 @@ python3 -m unittest discover -s tests -v
 | `/lockdown` / `/unlock` | Emergency read-only anti-raid lockdown with exact `ChatPermissions` snapshot & restore |
 | `/ban_media` | Reply to any scam/raid image to permanently index its 64-bit dHash into the $O(\log N)$ **BK-Tree** |
 | `/export_audit` | 30-day privacy-redacted compliance proof pack for `abuse@telegram.org` appeals |
+| `/about` & `/dev` | View bot version & developer contact links |
+
+---
+
+## Developer
+
+- **Telegram:** [@drkingbd](https://t.me/drkingbd)
+- **Website:** [drkingbd.cc](https://drkingbd.cc)

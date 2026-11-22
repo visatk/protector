@@ -7,6 +7,7 @@ import hmac
 import json
 import logging
 
+from protector import __developer_telegram__, __developer_website__, __version__
 from protector.bot import ALLOWED_UPDATES, AegisTGBot
 
 logger = logging.getLogger("aegistg.webhook")
@@ -63,7 +64,17 @@ class WebhookServer:
                 await self._write_response(
                     writer,
                     200,
-                    json.dumps({"status": "ok", "bot": self.bot.bot_username, "version": "2.0.0"}),
+                    json.dumps(
+                        {
+                            "status": "ok",
+                            "bot": self.bot.bot_username,
+                            "version": __version__,
+                            "developer": {
+                                "telegram": __developer_telegram__,
+                                "website": __developer_website__,
+                            },
+                        }
+                    ),
                     "application/json",
                 )
                 return

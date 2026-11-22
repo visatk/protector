@@ -2,3 +2,6 @@
 
 __version__ = "2.0.0"
 __app_name__ = "AegisTG Protector"
+__developer__ = "@drkingbd"
+__developer_telegram__ = "https://t.me/drkingbd"
+__developer_website__ = "https://drkingbd.cc"

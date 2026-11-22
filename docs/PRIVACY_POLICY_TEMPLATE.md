@@ -29,3 +29,7 @@ AegisTG processes Telegram updates **strictly and exclusively** to protect parti
 ## 5. Security Controls
 - Webhook endpoints enforce TLS and validate `X-Telegram-Bot-Api-Secret-Token`.
 - Access to the database and bot credentials is restricted to the system operator using least-privilege controls.
+
+## 6. Developer & Operator Contact
+- **Telegram:** [@drkingbd](https://t.me/drkingbd)
+- **Website:** [https://drkingbd.cc](https://drkingbd.cc)
